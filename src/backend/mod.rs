@@ -229,6 +229,9 @@ enum Internal {
     LikedIds(HashSet<String>),
     Playlists(Vec<PlaylistSummary>),
     SearchDone(SearchResults),
+    /// Delayed move to the next track after an unavailable one (carries the load
+    /// generation so that any newer user action cancels it).
+    SkipAfterUnavailable(u64),
 }
 
 struct Audio {
@@ -289,6 +292,11 @@ struct Core {
     /// Whether the player currently holds the current track (false once stopped).
     loaded: bool,
     unavailable_streak: u32,
+    /// Incremented by every load: identifies the attempt a delayed skip belongs to.
+    load_generation: u64,
+    load_started: Instant,
+    /// A fresh connection was already tried during the current failure streak.
+    reconnect_tried: bool,
     listened_ms: u64,
     audio_bytes: u64,
     last_usage: (u64, u64),
@@ -337,6 +345,9 @@ impl Core {
             pending_loads: 0,
             loaded: false,
             unavailable_streak: 0,
+            load_generation: 0,
+            load_started: Instant::now(),
+            reconnect_tried: false,
             listened_ms: 0,
             audio_bytes: 0,
             last_usage: (u64::MAX, u64::MAX),
@@ -751,6 +762,11 @@ impl Core {
                 }
                 self.send_app_status();
             }
+            Internal::SkipAfterUnavailable(generation) => {
+                if generation == self.load_generation {
+                    self.skip(false);
+                }
+            }
             Internal::LikedIds(ids) => self.liked_ids = Some(ids),
             Internal::Playlists(list) => {
                 self.remember_playlists(&list);
@@ -896,6 +912,8 @@ impl Core {
     }
 
     fn load(&mut self, track: Track, play: bool, position_ms: u32) {
+        self.load_generation += 1;
+        self.load_started = Instant::now();
         self.flush_listened();
         self.ui.send(Event::NowPlaying(Some(track.clone())));
         self.position_ms = position_ms;
@@ -1010,6 +1028,47 @@ impl Core {
         });
     }
 
+    /// A track could not be played: explain why, and avoid hammering Spotify.
+    fn on_unavailable(&mut self) {
+        self.playing = false;
+        self.loaded = false;
+        self.unavailable_streak += 1;
+        let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
+        let messages = crate::logger::playback_messages_since(self.load_started);
+        let reason = PlaybackFailure::from_messages(&messages);
+        log::warn!("track unavailable ({reason:?}): {messages:?}");
+        if self.unavailable_streak >= 3 {
+            if reason.is_audio_key() && !self.reconnect_tried {
+                // Keys are refused over the current access point: try a fresh
+                // connection (another access point) once before giving up.
+                self.reconnect_tried = true;
+                self.unavailable_streak = 0;
+                self.ui.error("Spotify refuse les clés audio : reconnexion puis nouvel essai…");
+                if let Some(session) = self.session.take() {
+                    session.shutdown();
+                }
+                if let Some(track) = self.queue.current().cloned() {
+                    self.load(track, true, 0);
+                }
+                return;
+            }
+            self.unavailable_streak = 0;
+            self.reconnect_tried = false;
+            self.ui.error(reason.stop_message());
+            self.send_playback(false);
+            return;
+        }
+        self.ui.error(format!("« {name} » : {} Titre suivant…", reason.short()));
+        self.send_playback(false);
+        // A short pause before the next attempt: skipping at full speed only
+        // triggers Spotify's rate limits.
+        let (internal, generation) = (self.internal.clone(), self.load_generation);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = internal.send(Internal::SkipAfterUnavailable(generation));
+        });
+    }
+
     fn handle_player(&mut self, event: PlayerEvent) {
         match event {
             PlayerEvent::PlayRequestIdChanged { .. } => {
@@ -1019,6 +1078,7 @@ impl Core {
             PlayerEvent::Playing { position_ms, .. } => {
                 self.flush_listened();
                 self.unavailable_streak = 0;
+                self.reconnect_tried = false;
                 self.playing = true;
                 self.position_ms = position_ms;
                 self.position_at = Instant::now();
@@ -1059,20 +1119,7 @@ impl Core {
                 self.playing = false;
                 self.skip(true);
             }
-            PlayerEvent::Unavailable { .. } => {
-                self.playing = false;
-                self.loaded = false;
-                self.unavailable_streak += 1;
-                let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
-                if self.unavailable_streak > 5 {
-                    self.ui.error("Plusieurs titres indisponibles d'affilée : lecture arrêtée.");
-                    self.unavailable_streak = 0;
-                    self.send_playback(false);
-                } else {
-                    self.ui.error(format!("« {name} » est indisponible, titre suivant."));
-                    self.skip(false);
-                }
-            }
+            PlayerEvent::Unavailable { .. } => self.on_unavailable(),
             _ => {}
         }
     }
@@ -1437,6 +1484,70 @@ async fn next_player_event(audio: &mut Option<Audio>) -> Option<PlayerEvent> {
     }
 }
 
+/// Why librespot gave up on a track, deduced from what it logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackFailure {
+    /// Spotify refused the decryption key for good (code 0x0001).
+    KeyDenied,
+    /// Spotify refused the key temporarily (0x0002), even after retries.
+    KeyDeniedTemporarily,
+    KeyTimeout,
+    Region,
+    Format,
+    Download,
+    Unknown,
+}
+
+impl PlaybackFailure {
+    fn from_messages(messages: &[String]) -> Self {
+        let has = |needle: &str| messages.iter().any(|m| m.contains(needle));
+        if has("audio key error 0x0001") || has("error audio key 0 1") {
+            Self::KeyDenied
+        } else if has("audio key error 0x0002") || has("error audio key 0 2") {
+            Self::KeyDeniedTemporarily
+        } else if has("Audio key response timeout") || has("audio key response timeout") {
+            Self::KeyTimeout
+        } else if has("in any supported format") {
+            Self::Format
+        } else if has("Track is unavailable") || has("is not available") {
+            Self::Region
+        } else if has("Unable to load encrypted file") || has("Unable to load audio item") {
+            Self::Download
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn is_audio_key(self) -> bool {
+        matches!(self, Self::KeyDenied | Self::KeyDeniedTemporarily | Self::KeyTimeout)
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            Self::KeyDenied => "Spotify refuse la clé de déchiffrement (code 0x0001).",
+            Self::KeyDeniedTemporarily => "Spotify refuse temporairement la clé de déchiffrement (0x0002).",
+            Self::KeyTimeout => "Spotify ne répond pas à la demande de clé audio.",
+            Self::Region => "titre non disponible pour ce compte ou ce pays.",
+            Self::Format => "aucun format audio compatible.",
+            Self::Download => "téléchargement impossible.",
+            Self::Unknown => "lecture impossible.",
+        }
+    }
+
+    fn stop_message(self) -> String {
+        match self {
+            Self::KeyDenied | Self::KeyDeniedTemporarily | Self::KeyTimeout => format!(
+                "Lecture arrêtée : {} Ce refus vient des serveurs de Spotify et touche en ce moment \
+                 d'autres lecteurs basés sur librespot. Réessayez un peu plus tard.",
+                self.short()
+            ),
+            _ => {
+                format!("Plusieurs titres d'affilée impossibles à lire ({}) : lecture arrêtée.", self.short())
+            }
+        }
+    }
+}
+
 /// Turns token endpoint errors into advice for the setup screen.
 fn app_error_hint(error: &str) -> String {
     let lower = error.to_lowercase();
@@ -1565,6 +1676,30 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explains_playback_failures() {
+        let from = |lines: &[&str]| {
+            PlaybackFailure::from_messages(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            from(&["error audio key 0 1", "Unable to load key, continuing without decryption: x"]),
+            PlaybackFailure::KeyDenied
+        );
+        assert_eq!(
+            from(&["Unable to load key: Service unavailable { audio key error 0x0002 }"]),
+            PlaybackFailure::KeyDeniedTemporarily
+        );
+        assert_eq!(from(&["Audio key response timeout"]), PlaybackFailure::KeyTimeout);
+        assert_eq!(from(&["spotify:track:<abc> is not available"]), PlaybackFailure::Region);
+        assert_eq!(from(&["<x> is not available in any supported format"]), PlaybackFailure::Format);
+        assert_eq!(from(&[]), PlaybackFailure::Unknown);
+        assert!(PlaybackFailure::KeyDenied.is_audio_key());
+        assert!(!PlaybackFailure::Region.is_audio_key());
+        crate::logger::remember_for_test("error audio key 0 1");
+        let recent = crate::logger::playback_messages_since(Instant::now() - Duration::from_secs(5));
+        assert_eq!(PlaybackFailure::from_messages(&recent), PlaybackFailure::KeyDenied);
+    }
 
     #[test]
     fn volume_mapping() {

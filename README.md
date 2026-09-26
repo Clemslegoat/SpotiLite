@@ -131,6 +131,13 @@ l'URI de redirection ou d'oublier l'application.
 - Pas de podcasts, de paroles, ni de mode « Spotify Connect » (piloter SpotiLite depuis le
   téléphone) : ces fonctions ont été laissées de côté pour rester léger.
 - Qualité maximale 320 kbit/s (pas de lossless).
+- **Titres « indisponibles » en série** : depuis fin 2025, Spotify refuse par moments les clés de
+  déchiffrement audio à certains comptes utilisant librespot
+  ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)). SpotiLite embarque
+  le correctif proposé en amont ([librespot#1763](https://github.com/librespot-org/librespot/pull/1763) :
+  nouvelles tentatives sur refus temporaire), marque une pause entre deux titres refusés, se
+  reconnecte une fois puis s'arrête en affichant la raison exacte. Un refus définitif (code
+  `0x0001`) ne peut pas être contourné côté client : réessayez plus tard.
 - SpotiLite est un client **non officiel**, sans lien avec Spotify AB. Il repose sur librespot,
   comme de nombreux lecteurs libres ; Spotify peut modifier son protocole à tout moment.
 
@@ -163,6 +170,7 @@ src/
 │   ├── webapi.rs    client minimal de l'API Web (gzip, pagination, reprise sur 429)
 │   ├── vault.rs     secrets chiffrés avec DPAPI sous Windows
 │   └── store.rs     cache disque (JSON et vignettes)
+vendor/librespot-core/   librespot-core 0.8.0 + nouvelles tentatives sur les clés audio
 ├── queue.rs         file de lecture locale (aléatoire, répétition, ajouts)
 ├── media.rs         touches multimédia et panneau média de Windows
 └── sys.rs           mesure et libération de la mémoire

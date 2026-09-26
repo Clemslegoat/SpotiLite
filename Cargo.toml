@@ -49,6 +49,14 @@ windows-sys = { version = "0.61", features = [
 # Icône et informations de version de l'exécutable Windows (rc.exe ou windres).
 winresource = { version = "0.1", default-features = false }
 
+# librespot-core 0.8.0 avec nouvelles tentatives sur les clés audio refusées
+# (voir vendor/librespot-core/README-SpotiLite.md).
+[patch.crates-io]
+librespot-core = { path = "vendor/librespot-core" }
+
+[workspace]
+exclude = ["vendor"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
