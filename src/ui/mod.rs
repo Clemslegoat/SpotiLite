@@ -77,6 +77,8 @@ impl Player {
 }
 
 struct Toast {
+    /// Messages with a key replace each other (e.g. a running counter).
+    key: Option<&'static str>,
     text: String,
     error: bool,
     at: Instant,
@@ -121,6 +123,8 @@ pub struct App {
     reveal_selected: bool,
     player: Player,
     covers: Covers,
+    /// Tracks Spotify refuses to third-party clients (greyed out, skipped).
+    refused: HashSet<String>,
     toasts: Vec<Toast>,
     usage: (u64, u64),
     memory: sys::Memory,
@@ -177,6 +181,7 @@ impl App {
             reveal_selected: false,
             player,
             covers: Covers::default(),
+            refused: HashSet::new(),
             toasts: Vec::new(),
             usage: (0, 0),
             memory: sys::memory(),
@@ -234,6 +239,7 @@ impl App {
         self.player.at = Some(Instant::now());
         self.player.liked.insert(tracks[2].id.clone(), true);
         self.player.upcoming = tracks[3..12].to_vec();
+        self.refused.insert(tracks[5].id.clone());
         self.app_status.state = if std::env::var_os("SPOTILITE_DEMO_SETUP").is_some() {
             AppState::NotConfigured
         } else {
@@ -329,6 +335,11 @@ impl App {
         match event {
             Event::Info(text) => self.toast(text, false),
             Event::Error(text) => self.toast(text, true),
+            Event::Notice { key, text, error } => self.toast_keyed(Some(key), text, error),
+            Event::Refused(ids) => self.refused = ids,
+            Event::TrackRefused(id) => {
+                self.refused.insert(id);
+            }
             Event::NeedLogin => self.auth = Auth::NeedLogin,
             Event::LoginPending { url } => self.auth = Auth::Pending { url },
             Event::Offline => {
@@ -410,11 +421,15 @@ impl App {
     }
 
     pub(super) fn toast(&mut self, text: String, error: bool) {
+        self.toast_keyed(None, text, error);
+    }
+
+    fn toast_keyed(&mut self, key: Option<&'static str>, text: String, error: bool) {
         if error {
             log::warn!("{text}");
         }
-        self.toasts.retain(|t| t.text != text);
-        self.toasts.push(Toast { text, error, at: Instant::now() });
+        self.toasts.retain(|t| t.text != text && (key.is_none() || t.key != key));
+        self.toasts.push(Toast { key, text, error, at: Instant::now() });
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
         }

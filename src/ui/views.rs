@@ -524,14 +524,17 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
         ui.painter().rect_filled(rect, CornerRadius::same(4), if selected { p.raised } else { p.hover });
     }
     let y = rect.center().y;
-    let text_color = if !track.playable {
+    // Refused by Spotify to third-party clients: shown greyed out, skipped by
+    // automatic playback, but a double-click still tries (the decision can change).
+    let refused = app.refused.contains(&track.id);
+    let text_color = if !track.playable || refused {
         p.faint
     } else if is_current {
         p.accent
     } else {
         p.text
     };
-    let dim = if track.playable { p.dim } else { p.faint };
+    let dim = if track.playable && !refused { p.dim } else { p.faint };
 
     // Index / state column.
     let index_rect = egui::Rect::from_min_size(rect.min, vec2(cols.index, rect.height()));
@@ -590,8 +593,14 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
         p.faint,
     );
 
-    let response =
+    let mut response =
         response.on_hover_cursor(if track.playable { CursorIcon::Default } else { CursorIcon::NotAllowed });
+    if refused {
+        response = response.on_hover_text(
+            "Spotify réserve la lecture de ce titre à ses applications officielles : \
+             il est sauté automatiquement. Double-cliquez pour réessayer.",
+        );
+    }
     if link_clicked {
         return;
     }

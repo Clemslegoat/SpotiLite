@@ -100,6 +100,15 @@ pub struct AppStatus {
 pub enum Event {
     Info(String),
     Error(String),
+    /// A message that replaces the previous one with the same key (counters).
+    Notice {
+        key: &'static str,
+        text: String,
+        error: bool,
+    },
+    /// Tracks Spotify refuses to third-party clients (shown greyed out).
+    Refused(HashSet<String>),
+    TrackRefused(String),
     NeedLogin,
     LoginPending {
         url: String,
@@ -263,6 +272,10 @@ struct CachedArtist {
     albums: Vec<AlbumSummary>,
 }
 
+/// Consecutive refused tracks before concluding the whole account is refused.
+const MAX_REFUSED_IN_A_ROW: u32 = 10;
+const REFUSED_TTL_SECS: u64 = 14 * 24 * 3600;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -297,6 +310,9 @@ struct Core {
     load_started: Instant,
     /// A fresh connection was already tried during the current failure streak.
     reconnect_tried: bool,
+    /// Tracks whose audio key Spotify refused (id → when), kept 14 days.
+    refused: HashMap<String, u64>,
+    skipped_refused: u32,
     listened_ms: u64,
     audio_bytes: u64,
     last_usage: (u64, u64),
@@ -348,6 +364,8 @@ impl Core {
             load_generation: 0,
             load_started: Instant::now(),
             reconnect_tried: false,
+            refused: HashMap::new(),
+            skipped_refused: 0,
             listened_ms: 0,
             audio_bytes: 0,
             last_usage: (u64::MAX, u64::MAX),
@@ -395,6 +413,13 @@ impl Core {
             self.ui.send(Event::Playlists(list));
         }
         self.send_queue();
+        // Tracks refused recently are not retried (the decision may change, hence
+        // the expiry).
+        let now = now_secs();
+        self.refused = self.store.load::<HashMap<String, u64>>("refused").unwrap_or_default();
+        self.refused.retain(|_, at| now.saturating_sub(*at) < REFUSED_TTL_SECS);
+        self.queue.set_blocked(self.refused.keys().cloned().collect());
+        self.ui.send(Event::Refused(self.refused.keys().cloned().collect()));
         // Version 0.1 kept the client id in the settings: move it to the vault.
         if self.api.saved_app().is_none() && !self.settings.legacy_client_id.is_empty() {
             self.api.save_app(&AppCredentials {
@@ -614,6 +639,9 @@ impl Core {
         self.queue = Queue::default();
         self.playlists.clear();
         self.liked_ids = None;
+        self.refused.clear();
+        self.queue.set_blocked(HashSet::new());
+        self.ui.send(Event::Refused(HashSet::new()));
         self.refreshed.clear();
         self.searches.clear();
         self.playing = false;
@@ -1033,21 +1061,61 @@ impl Core {
         self.playing = false;
         self.loaded = false;
         self.unavailable_streak += 1;
-        let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
+        let current = self.queue.current().cloned();
+        let name = current.as_ref().map(|t| t.name.clone()).unwrap_or_default();
         let messages = crate::logger::playback_messages_since(self.load_started);
         let reason = PlaybackFailure::from_messages(&messages);
         log::warn!("track unavailable ({reason:?}): {messages:?}");
+
+        if reason == PlaybackFailure::KeyDenied {
+            // Spotify decides per track: licence-restricted tracks only get their
+            // key through the official apps' DRM. Remember them so they are never
+            // retried (no wasted data), and keep going with the others.
+            if let Some(track) = &current {
+                self.remember_refused(track.id.clone());
+            }
+            self.skipped_refused += 1;
+            if self.unavailable_streak >= MAX_REFUSED_IN_A_ROW {
+                self.unavailable_streak = 0;
+                self.ui.send(Event::Notice {
+                    key: "refused",
+                    text: format!(
+                        "Lecture arrêtée : Spotify a refusé les {MAX_REFUSED_IN_A_ROW} derniers titres. \
+                         Si aucun titre ne passe, le refus concerne sans doute tout le compte : réessayez plus tard."
+                    ),
+                    error: true,
+                });
+                self.send_playback(false);
+                return;
+            }
+            let count = self.skipped_refused;
+            self.ui.send(Event::Notice {
+                key: "refused",
+                text: format!(
+                    "{count} titre{} ignoré{} : Spotify réserve leur lecture à ses applications officielles.",
+                    if count > 1 { "s" } else { "" },
+                    if count > 1 { "s" } else { "" },
+                ),
+                error: false,
+            });
+            self.send_playback(false);
+            self.schedule_skip(Duration::from_millis(700));
+            return;
+        }
+
         if self.unavailable_streak >= 3 {
-            if reason.is_audio_key() && !self.reconnect_tried {
-                // Keys are refused over the current access point: try a fresh
-                // connection (another access point) once before giving up.
+            if matches!(reason, PlaybackFailure::KeyDeniedTemporarily | PlaybackFailure::KeyTimeout)
+                && !self.reconnect_tried
+            {
+                // Keys time out or are refused temporarily over this access point:
+                // try a fresh connection once before giving up.
                 self.reconnect_tried = true;
                 self.unavailable_streak = 0;
-                self.ui.error("Spotify refuse les clés audio : reconnexion puis nouvel essai…");
+                self.ui.error("Spotify ne délivre pas les clés audio : reconnexion puis nouvel essai…");
                 if let Some(session) = self.session.take() {
                     session.shutdown();
                 }
-                if let Some(track) = self.queue.current().cloned() {
+                if let Some(track) = current {
                     self.load(track, true, 0);
                 }
                 return;
@@ -1060,13 +1128,24 @@ impl Core {
         }
         self.ui.error(format!("« {name} » : {} Titre suivant…", reason.short()));
         self.send_playback(false);
-        // A short pause before the next attempt: skipping at full speed only
-        // triggers Spotify's rate limits.
+        // A pause before the next attempt: skipping at full speed only triggers
+        // Spotify's rate limits.
+        self.schedule_skip(Duration::from_millis(1500));
+    }
+
+    fn schedule_skip(&self, delay: Duration) {
         let (internal, generation) = (self.internal.clone(), self.load_generation);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(delay).await;
             let _ = internal.send(Internal::SkipAfterUnavailable(generation));
         });
+    }
+
+    fn remember_refused(&mut self, id: String) {
+        self.refused.insert(id.clone(), now_secs());
+        self.store.save("refused", &self.refused);
+        self.queue.block(id.clone());
+        self.ui.send(Event::TrackRefused(id));
     }
 
     fn handle_player(&mut self, event: PlayerEvent) {
@@ -1518,10 +1597,6 @@ impl PlaybackFailure {
         }
     }
 
-    fn is_audio_key(self) -> bool {
-        matches!(self, Self::KeyDenied | Self::KeyDeniedTemporarily | Self::KeyTimeout)
-    }
-
     fn short(self) -> &'static str {
         match self {
             Self::KeyDenied => "Spotify refuse la clé de déchiffrement (code 0x0001).",
@@ -1694,8 +1769,6 @@ mod tests {
         assert_eq!(from(&["spotify:track:<abc> is not available"]), PlaybackFailure::Region);
         assert_eq!(from(&["<x> is not available in any supported format"]), PlaybackFailure::Format);
         assert_eq!(from(&[]), PlaybackFailure::Unknown);
-        assert!(PlaybackFailure::KeyDenied.is_audio_key());
-        assert!(!PlaybackFailure::Region.is_audio_key());
         crate::logger::remember_for_test("error audio key 0 1");
         let recent = crate::logger::playback_messages_since(Instant::now() - Duration::from_secs(5));
         assert_eq!(PlaybackFailure::from_messages(&recent), PlaybackFailure::KeyDenied);

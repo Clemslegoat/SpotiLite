@@ -2,7 +2,7 @@
 //! round trips), which keeps latency low and avoids any extra network request when
 //! skipping tracks.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use rand::seq::SliceRandom;
@@ -21,9 +21,25 @@ pub struct Queue {
     current: Option<Track>,
     shuffle: bool,
     repeat: Repeat,
+    /// Tracks Spotify refused to play: automatic playback skips them.
+    blocked: HashSet<String>,
 }
 
 impl Queue {
+    /// Remembers a track that cannot be played so that it is skipped from now on.
+    pub fn block(&mut self, id: String) {
+        self.blocked.insert(id);
+    }
+
+    pub fn set_blocked(&mut self, ids: HashSet<String>) {
+        self.blocked = ids;
+    }
+
+    /// Can this track be reached by automatic playback (next, previous, preload)?
+    fn reachable(&self, track: &Track) -> bool {
+        track.playable && !self.blocked.contains(&track.id)
+    }
+
     pub fn current(&self) -> Option<&Track> {
         self.current.as_ref()
     }
@@ -115,7 +131,7 @@ impl Queue {
                 return None;
             }
             let track = &self.context[self.order[self.pos]];
-            if track.playable {
+            if self.reachable(track) {
                 self.current = Some(track.clone());
                 return self.current.clone();
             }
@@ -135,7 +151,7 @@ impl Queue {
                 return None;
             }
             let track = &self.context[self.order[self.pos]];
-            if track.playable {
+            if self.reachable(track) {
                 self.current = Some(track.clone());
                 return self.current.clone();
             }
@@ -163,7 +179,7 @@ impl Queue {
                 pos = 0;
             }
             let track = &self.context[self.order[pos]];
-            if track.playable {
+            if self.reachable(track) {
                 return Some(track);
             }
         }
@@ -179,7 +195,7 @@ impl Queue {
                 .iter()
                 .skip(self.pos + 1)
                 .map(|&i| &self.context[i])
-                .filter(|t| t.playable)
+                .filter(|t| self.reachable(t))
                 .take(rest)
                 .cloned(),
         );
@@ -257,6 +273,20 @@ mod tests {
         let mut q = Queue::default();
         assert_eq!(id(q.play_context(Arc::new(list), 0)), "t2");
         assert_eq!(id(q.advance(true)), "t3");
+    }
+
+    #[test]
+    fn blocked_tracks_are_skipped_but_can_still_be_chosen() {
+        let mut q = Queue::default();
+        q.block("t1".into());
+        q.block("t2".into());
+        // An explicit choice is honoured…
+        assert_eq!(id(q.play_context(tracks(4), 1)), "t1");
+        // …but automatic playback skips refused tracks.
+        assert_eq!(q.peek_next().map(|t| t.id.as_str()), Some("t3"));
+        assert_eq!(id(q.advance(true)), "t3");
+        assert_eq!(id(q.back()), "t0");
+        assert!(q.upcoming(10).iter().all(|t| t.id != "t1" && t.id != "t2"));
     }
 
     #[test]
