@@ -1,0 +1,61 @@
+[package]
+name = "spotilite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Client Spotify Premium natif et ultra léger pour Windows"
+license = "MIT"
+repository = "https://github.com/clemslegoat/SpotiLite"
+readme = "README.md"
+build = "build.rs"
+
+[dependencies]
+# Lecture audio Premium (protocole Spotify natif, décodage Ogg Vorbis, sortie WASAPI via cpal).
+librespot-core = { version = "0.8", default-features = false, features = ["native-tls"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["native-tls", "rodio-backend"] }
+librespot-metadata = { version = "0.8", default-features = false, features = ["native-tls"] }
+
+# Interface : egui en mode immédiat, rendu OpenGL (glow) – pas de navigateur embarqué.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+# HTTP : même pile que librespot (reqwest 0.12 / hyper), TLS natif du système (SChannel sous Windows).
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+url = "2"
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+# Touches multimédia et panneau média de Windows (System Media Transport Controls).
+souvlaki = { version = "0.8", default-features = false }
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+# Icône et informations de version de l'exécutable Windows (rc.exe ou windres).
+winresource = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# `panic = "unwind"` volontairement : si la sortie audio ne peut pas s'ouvrir, librespot
+# panique dans son thread ; on veut afficher une erreur plutôt que fermer l'application.
+
+[profile.dev.package."*"]
+# Décodage Vorbis et rendu utilisables même en build de debug.
+opt-level = 2
