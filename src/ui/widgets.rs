@@ -165,7 +165,7 @@ pub fn icon_button(
         let painter = ui.painter();
         let hovered = response.hovered();
         let color = if emphasis {
-            painter.circle_filled(rect.center(), size * 0.5, if hovered { p.text } else { p.accent });
+            painter.circle_filled(rect.center(), size * 0.5, if hovered { p.accent_hover } else { p.accent });
             p.on_accent
         } else {
             if hovered {
@@ -217,7 +217,7 @@ pub fn pill(ui: &mut Ui, p: &Palette, label: &str, primary: bool) -> Response {
     let hovered = response.hovered();
     let (fill, fg) = match (primary, hovered) {
         (true, false) => (p.accent, p.on_accent),
-        (true, true) => (p.text, p.bg),
+        (true, true) => (p.accent_hover, p.on_accent),
         (false, false) => (p.raised, p.text),
         (false, true) => (p.hover, p.text),
     };

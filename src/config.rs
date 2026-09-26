@@ -44,13 +44,6 @@ impl Quality {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThemeChoice {
-    #[default]
-    Dark,
-    Light,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -61,13 +54,13 @@ pub struct Settings {
     pub audio_cache_mb: u64,
     pub volume: f32,
     pub normalisation: bool,
-    pub theme: ThemeChoice,
     pub ui_scale: f32,
     pub shuffle: bool,
     pub repeat: Repeat,
-    /// Optional personal Spotify application (developer.spotify.com) used for the Web
-    /// API. Empty: the streaming session token is used instead.
-    pub client_id: String,
+    /// Client id entered in version 0.1 (read once to migrate it, never written back).
+    #[serde(rename = "client_id", skip_serializing)]
+    pub legacy_client_id: String,
+    /// Port of the redirect URI registered in the user's Spotify application.
     pub redirect_port: u16,
     /// Release unused memory pages when the window is minimized (Windows only).
     pub trim_when_minimized: bool,
@@ -82,11 +75,10 @@ impl Default for Settings {
             audio_cache_mb: 1024,
             volume: 0.7,
             normalisation: true,
-            theme: ThemeChoice::Dark,
             ui_scale: 1.0,
             shuffle: false,
             repeat: Repeat::Off,
-            client_id: String::new(),
+            legacy_client_id: String::new(),
             redirect_port: 8898,
             trim_when_minimized: true,
             window_size: [980.0, 640.0],
@@ -117,7 +109,7 @@ impl Settings {
     fn sanitized(mut self) -> Self {
         self.volume = self.volume.clamp(0.0, 1.0);
         self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
-        self.client_id = self.client_id.trim().to_string();
+        self.legacy_client_id = self.legacy_client_id.trim().to_string();
         if self.redirect_port == 0 {
             self.redirect_port = 8898;
         }
@@ -179,6 +171,11 @@ impl Paths {
         self.config.join("settings.json")
     }
 
+    /// Client id and secret of the user's Spotify application (encrypted on Windows).
+    pub fn app_file(&self) -> PathBuf {
+        self.config.join("spotify-app.dat")
+    }
+
     pub fn web_token_file(&self) -> PathBuf {
         self.config.join("webapi-token.json")
     }
@@ -233,5 +230,15 @@ mod tests {
         assert_eq!(s.volume, 1.0);
         assert!(s.show_covers);
         assert_eq!(s.redirect_port, 8898);
+    }
+
+    #[test]
+    fn legacy_client_id_is_read_but_never_written() {
+        let s: Settings = serde_json::from_str(r#"{"client_id":" abc ","theme":"Light"}"#).unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.legacy_client_id, "abc");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("client_id"));
+        assert!(!json.contains("theme"));
     }
 }

@@ -1,4 +1,5 @@
-//! SpotiLite's own look: flat surfaces, one warm accent, text-first layout.
+//! SpotiLite's look: pure black (AMOLED) surfaces, white as the only accent,
+//! neutral greys for hierarchy. Black pixels are switched off on OLED screens.
 
 use std::sync::Arc;
 
@@ -6,8 +7,6 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, TextStyle,
     Vec2,
 };
-
-use crate::config::ThemeChoice;
 
 #[derive(Clone, Copy)]
 pub struct Palette {
@@ -20,42 +19,27 @@ pub struct Palette {
     pub dim: Color32,
     pub faint: Color32,
     pub accent: Color32,
+    pub accent_hover: Color32,
     pub on_accent: Color32,
+    /// Errors stay monochrome too: they are told apart by a white frame, not a color.
     pub danger: Color32,
-    pub dark: bool,
 }
 
 impl Palette {
-    pub fn for_choice(choice: ThemeChoice) -> Self {
-        match choice {
-            ThemeChoice::Dark => Self {
-                bg: Color32::from_rgb(0x0f, 0x11, 0x15),
-                panel: Color32::from_rgb(0x13, 0x16, 0x1b),
-                raised: Color32::from_rgb(0x1a, 0x1e, 0x25),
-                hover: Color32::from_rgb(0x1f, 0x24, 0x2c),
-                line: Color32::from_rgb(0x24, 0x2a, 0x33),
-                text: Color32::from_rgb(0xe8, 0xe6, 0xe3),
-                dim: Color32::from_rgb(0x8b, 0x93, 0xa1),
-                faint: Color32::from_rgb(0x5a, 0x61, 0x6d),
-                accent: Color32::from_rgb(0xe8, 0xb0, 0x4b),
-                on_accent: Color32::from_rgb(0x1a, 0x12, 0x06),
-                danger: Color32::from_rgb(0xe5, 0x48, 0x4d),
-                dark: true,
-            },
-            ThemeChoice::Light => Self {
-                bg: Color32::from_rgb(0xf6, 0xf4, 0xef),
-                panel: Color32::from_rgb(0xef, 0xec, 0xe5),
-                raised: Color32::from_rgb(0xff, 0xff, 0xff),
-                hover: Color32::from_rgb(0xe7, 0xe3, 0xda),
-                line: Color32::from_rgb(0xdd, 0xd8, 0xcd),
-                text: Color32::from_rgb(0x1b, 0x1d, 0x21),
-                dim: Color32::from_rgb(0x5f, 0x66, 0x72),
-                faint: Color32::from_rgb(0x9a, 0xa0, 0xaa),
-                accent: Color32::from_rgb(0xa8, 0x66, 0x0a),
-                on_accent: Color32::WHITE,
-                danger: Color32::from_rgb(0xc6, 0x2f, 0x35),
-                dark: false,
-            },
+    pub const fn amoled() -> Self {
+        Self {
+            bg: Color32::from_rgb(0x00, 0x00, 0x00),
+            panel: Color32::from_rgb(0x00, 0x00, 0x00),
+            raised: Color32::from_rgb(0x16, 0x16, 0x16),
+            hover: Color32::from_rgb(0x0f, 0x0f, 0x0f),
+            line: Color32::from_rgb(0x22, 0x22, 0x22),
+            text: Color32::from_rgb(0xe6, 0xe6, 0xe6),
+            dim: Color32::from_rgb(0x8c, 0x8c, 0x8c),
+            faint: Color32::from_rgb(0x58, 0x58, 0x58),
+            accent: Color32::WHITE,
+            accent_hover: Color32::from_rgb(0xc8, 0xc8, 0xc8),
+            on_accent: Color32::BLACK,
+            danger: Color32::WHITE,
         }
     }
 }
@@ -81,8 +65,10 @@ pub fn small_font() -> FontId {
 }
 
 pub fn apply(ctx: &egui::Context, p: &Palette) {
-    let theme = if p.dark { egui::Theme::Dark } else { egui::Theme::Light };
+    let theme = egui::Theme::Dark;
     ctx.set_theme(theme);
+    // Dark window title bar on Windows 10/11, to match the black window.
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
     ctx.style_mut_of(theme, |style| {
         style.text_styles = [
             (TextStyle::Heading, heading_font()),
@@ -100,7 +86,7 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         style.animation_time = 0.08;
 
         let v = &mut style.visuals;
-        v.dark_mode = p.dark;
+        v.dark_mode = true;
         v.override_text_color = None;
         v.panel_fill = p.bg;
         v.window_fill = p.raised;
@@ -115,7 +101,7 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         v.hyperlink_color = p.accent;
         v.error_fg_color = p.danger;
         v.warn_fg_color = p.accent;
-        v.selection.bg_fill = p.accent.gamma_multiply(0.35);
+        v.selection.bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
         v.selection.stroke = Stroke::new(1.0, p.accent);
         v.text_cursor.stroke = Stroke::new(2.0, p.accent);
         v.striped = false;
@@ -127,11 +113,13 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         w.noninteractive.bg_stroke = Stroke::new(1.0, p.line);
         w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
         w.noninteractive.corner_radius = radius;
+        let hovered = Color32::from_rgb(0x1f, 0x1f, 0x1f);
+        let pressed = Color32::from_rgb(0x2a, 0x2a, 0x2a);
         for (state, fill, fg) in [
             (&mut w.inactive, p.raised, p.text),
-            (&mut w.hovered, p.hover, p.text),
-            (&mut w.active, p.line, p.text),
-            (&mut w.open, p.hover, p.text),
+            (&mut w.hovered, hovered, p.accent),
+            (&mut w.active, pressed, p.accent),
+            (&mut w.open, hovered, p.accent),
         ] {
             state.bg_fill = fill;
             state.weak_bg_fill = fill;

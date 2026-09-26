@@ -6,6 +6,7 @@
 
 mod auth;
 mod store;
+mod vault;
 mod webapi;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -31,7 +32,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::config::{Paths, Quality, Settings};
 use crate::model::{AlbumSummary, ArtistRef, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
 use crate::queue::Queue;
-use auth::PkceFlow;
+pub use auth::AppCredentials;
+use auth::{AuthFlow, OAuthToken};
 use store::Store;
 use webapi::{ApiError, WebApi};
 
@@ -40,11 +42,22 @@ pub enum Command {
     Login,
     CancelLogin,
     Logout,
-    ConnectPersonalApi,
-    DisconnectPersonalApi,
+    /// Saves the user's Spotify application and authorizes it in the browser.
+    SetupApp(AppCredentials),
+    /// Authorizes the saved application again.
+    ReconnectApp,
+    CancelAppLogin,
+    /// Disconnects the application and deletes its saved credentials.
+    ForgetApp,
     LoadPlaylists,
-    Open { view: ViewKey, force: bool },
-    Play { tracks: Arc<Vec<Track>>, index: usize },
+    Open {
+        view: ViewKey,
+        force: bool,
+    },
+    Play {
+        tracks: Arc<Vec<Track>>,
+        index: usize,
+    },
     PlayPause,
     Next,
     Previous,
@@ -54,18 +67,33 @@ pub enum Command {
     SetRepeat(Repeat),
     Enqueue(Track),
     ClearQueue,
-    SetLiked { track: Track, liked: bool },
+    SetLiked {
+        track: Track,
+        liked: bool,
+    },
     FetchImage(String),
     ApplySettings(Box<Settings>),
     ClearCache,
     Shutdown,
 }
 
+/// State of the user's own Spotify application, which serves the whole library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PersonalApi {
+pub enum AppState {
+    /// Unknown until the backend has read the saved credentials.
+    Unknown,
     NotConfigured,
+    /// Waiting for the user to accept in the browser.
+    Authorizing,
     Disconnected,
     Connected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppStatus {
+    pub state: AppState,
+    pub client_id: String,
+    pub has_secret: bool,
 }
 
 /// Notifications for the interface.
@@ -82,7 +110,7 @@ pub enum Event {
     LoggedIn {
         user: String,
     },
-    PersonalApi(PersonalApi),
+    App(AppStatus),
     Playlists(Vec<PlaylistSummary>),
     Loading(ViewKey),
     Tracks {
@@ -197,7 +225,7 @@ impl Backend {
 enum Internal {
     StreamingToken(Result<String, String>),
     Connected(Result<Session, (String, bool)>),
-    PersonalToken(Result<(String, auth::OAuthToken), String>),
+    AppToken(Result<(AppCredentials, OAuthToken), String>),
     LikedIds(HashSet<String>),
     Playlists(Vec<PlaylistSummary>),
     SearchDone(SearchResults),
@@ -246,7 +274,10 @@ struct Core {
     cache: Option<Cache>,
     api_bytes: Arc<AtomicU64>,
     session: Option<Session>,
-    api: Option<Arc<WebApi>>,
+    api: Arc<WebApi>,
+    /// The user's Spotify application is authorized: library calls can be made.
+    app_connected: bool,
+    app_login: Option<Arc<AtomicBool>>,
     audio: Option<Audio>,
     queue: Queue,
     playing: bool,
@@ -282,6 +313,8 @@ impl Core {
             .build()
             .expect("http client");
         let store = Store::new(paths.data_cache(), paths.image_cache());
+        let api_bytes = Arc::new(AtomicU64::new(0));
+        let api = Arc::new(WebApi::new(http.clone(), paths.clone(), api_bytes.clone()));
         let mut queue = Queue::default();
         queue.set_shuffle(settings.shuffle);
         queue.set_repeat(settings.repeat);
@@ -291,9 +324,11 @@ impl Core {
             http,
             store,
             cache: None,
-            api_bytes: Arc::new(AtomicU64::new(0)),
+            api_bytes,
             session: None,
-            api: None,
+            api,
+            app_connected: false,
+            app_login: None,
             audio: None,
             queue,
             playing: false,
@@ -324,7 +359,7 @@ impl Core {
         mut commands: UnboundedReceiver<Command>,
         mut internal: UnboundedReceiver<Internal>,
     ) {
-        self.startup();
+        self.startup().await;
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -341,7 +376,7 @@ impl Core {
         self.shutdown();
     }
 
-    fn startup(&mut self) {
+    async fn startup(&mut self) {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.prune());
         if let Some(list) = self.store.load::<Vec<PlaylistSummary>>("playlists") {
@@ -349,6 +384,20 @@ impl Core {
             self.ui.send(Event::Playlists(list));
         }
         self.send_queue();
+        // Version 0.1 kept the client id in the settings: move it to the vault.
+        if self.api.saved_app().is_none() && !self.settings.legacy_client_id.is_empty() {
+            self.api.save_app(&AppCredentials {
+                client_id: self.settings.legacy_client_id.clone(),
+                client_secret: String::new(),
+            });
+        }
+        // The library only needs the user's application, not the audio session:
+        // it can load while the audio connection is still being established.
+        self.app_connected = self.api.restore().await;
+        self.send_app_status();
+        if self.app_connected {
+            self.load_playlists();
+        }
         match self.librespot_cache().and_then(|c| c.credentials()) {
             Some(credentials) => self.connect(credentials, false),
             None => self.ui.send(Event::NeedLogin),
@@ -356,7 +405,7 @@ impl Core {
     }
 
     fn shutdown(&mut self) {
-        if let Some(cancel) = &self.login_cancel {
+        for cancel in [&self.login_cancel, &self.app_login].into_iter().flatten() {
             cancel.store(true, Ordering::Relaxed);
         }
         if let Some(audio) = self.audio.take() {
@@ -433,42 +482,18 @@ impl Core {
         self.connecting = false;
         let user = session.username();
         log::info!("connected as {user}");
-        match &self.api {
-            Some(api) => api.set_session(session.clone()),
-            None => {
-                let api = Arc::new(WebApi::new(
-                    self.http.clone(),
-                    session.clone(),
-                    self.paths.clone(),
-                    self.api_bytes.clone(),
-                ));
-                api.load_personal(&self.settings.client_id).await;
-                self.api = Some(api);
-            }
-        }
         match &self.audio {
             Some(audio) if !audio.player.is_invalid() => audio.player.set_session(session.clone()),
             _ => self.audio = None,
         }
         self.session = Some(session);
-        self.send_personal_state().await;
 
         let display = self.store.load::<String>("me").unwrap_or(user);
         self.ui.send(Event::LoggedIn { user: display });
-        if self.store.load::<String>("me").is_none() {
-            let api = self.api.clone().expect("api");
-            let (ui, store) = (self.ui.clone(), self.store.clone());
-            tokio::spawn(async move {
-                if let Ok(name) = api.me().await {
-                    store.save("me", &name);
-                    ui.send(Event::LoggedIn { user: name });
-                }
-            });
-        }
+        self.fetch_display_name();
         if let Some(liked) = self.store.load::<CachedTracks>("liked") {
             self.liked_ids = Some(liked.tracks.into_iter().map(|t| t.id).collect());
         }
-        self.load_playlists();
         if std::mem::take(&mut self.pending_play)
             && let Some(track) = self.queue.current().cloned()
         {
@@ -481,7 +506,11 @@ impl Core {
         if let Some(cancel) = self.login_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
-        let flow = match PkceFlow::start(auth::SPOTIFY_DESKTOP_CLIENT_ID, 0, auth::STREAMING_SCOPES) {
+        let desktop = AppCredentials {
+            client_id: auth::SPOTIFY_DESKTOP_CLIENT_ID.into(),
+            client_secret: String::new(),
+        };
+        let flow = match AuthFlow::start(desktop, 0, auth::STREAMING_SCOPES) {
             Ok(flow) => flow,
             Err(e) => return self.ui.error(format!("Connexion impossible : {e}")),
         };
@@ -496,32 +525,63 @@ impl Core {
         });
     }
 
-    fn start_personal_login(&mut self) {
-        let client_id = self.settings.client_id.clone();
-        if client_id.is_empty() {
-            return self.ui.error("Renseignez d'abord votre Client ID dans les réglages.");
+    /// Opens the user's Spotify application authorization in the browser.
+    fn start_app_login(&mut self, app: AppCredentials) {
+        if let Some(cancel) = self.app_login.take() {
+            cancel.store(true, Ordering::Relaxed);
         }
-        let flow = match PkceFlow::start(&client_id, self.settings.redirect_port, auth::WEB_API_SCOPES) {
+        let flow = match AuthFlow::start(app.clone(), self.settings.redirect_port, auth::WEB_API_SCOPES) {
             Ok(flow) => flow,
-            Err(e) => return self.ui.error(format!("Connexion impossible : {e}")),
+            Err(e) => {
+                self.send_app_status();
+                return self.ui.error(format!(
+                    "Impossible d'écouter sur le port {} : {e}. Changez le port dans les réglages (et dans le tableau de bord Spotify).",
+                    self.settings.redirect_port
+                ));
+            }
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        self.ui.send(Event::Info("Autorisez SpotiLite dans votre navigateur…".into()));
+        self.app_login = Some(cancel.clone());
+        self.send_app_status();
         let _ = open::that_detached(&flow.auth_url);
         let (http, internal) = (self.http.clone(), self.internal.clone());
         tokio::spawn(async move {
-            let result = run_flow(flow, cancel, http).await.map(|t| (client_id, t));
-            let _ = internal.send(Internal::PersonalToken(result));
+            let result = run_flow(flow, cancel, http).await.map(|token| (app, token));
+            let _ = internal.send(Internal::AppToken(result));
         });
     }
 
-    async fn send_personal_state(&self) {
-        let state = match &self.api {
-            _ if self.settings.client_id.is_empty() => PersonalApi::NotConfigured,
-            Some(api) if api.has_personal().await => PersonalApi::Connected,
-            _ => PersonalApi::Disconnected,
+    fn send_app_status(&self) {
+        let saved = self.api.saved_app();
+        let state = if self.app_login.is_some() {
+            AppState::Authorizing
+        } else if self.app_connected {
+            AppState::Connected
+        } else if saved.is_some() {
+            AppState::Disconnected
+        } else {
+            AppState::NotConfigured
         };
-        self.ui.send(Event::PersonalApi(state));
+        self.ui.send(Event::App(AppStatus {
+            state,
+            has_secret: saved.as_ref().is_some_and(|a| !a.client_secret.is_empty()),
+            client_id: saved.map(|a| a.client_id).unwrap_or_default(),
+        }));
+    }
+
+    /// The account name shown in the interface (one small request, cached).
+    fn fetch_display_name(&self) {
+        let Some(api) = self.api() else { return };
+        if self.store.load::<String>("me").is_some() {
+            return;
+        }
+        let (ui, store) = (self.ui.clone(), self.store.clone());
+        tokio::spawn(async move {
+            if let Ok(name) = api.me().await {
+                store.save("me", &name);
+                ui.send(Event::LoggedIn { user: name });
+            }
+        });
     }
 
     fn logout(&mut self) {
@@ -533,9 +593,12 @@ impl Core {
             session.shutdown();
         }
         let _ = std::fs::remove_file(self.paths.config.join("credentials.json"));
-        let _ = std::fs::remove_file(self.paths.web_token_file());
+        // The application credentials stay saved: logging in again only needs one click.
+        let api = self.api.clone();
+        tokio::spawn(async move { api.disconnect(false).await });
+        self.app_connected = false;
+        self.send_app_status();
         self.store.clear();
-        self.api = None;
         self.cache = None;
         self.queue = Queue::default();
         self.playlists.clear();
@@ -560,12 +623,34 @@ impl Core {
                 }
             }
             Command::Logout => self.logout(),
-            Command::ConnectPersonalApi => self.start_personal_login(),
-            Command::DisconnectPersonalApi => {
-                if let Some(api) = &self.api {
-                    api.clear_personal().await;
+            Command::SetupApp(app) => {
+                let app = AppCredentials {
+                    client_id: app.client_id.trim().to_string(),
+                    client_secret: app.client_secret.trim().to_string(),
+                };
+                // A new application invalidates the previous authorization.
+                self.api.disconnect(true).await;
+                self.app_connected = false;
+                self.api.save_app(&app);
+                self.start_app_login(app);
+            }
+            Command::ReconnectApp => match self.api.saved_app() {
+                Some(app) => self.start_app_login(app),
+                None => self.send_app_status(),
+            },
+            Command::CancelAppLogin => {
+                if let Some(cancel) = self.app_login.take() {
+                    cancel.store(true, Ordering::Relaxed);
                 }
-                self.send_personal_state().await;
+                self.send_app_status();
+            }
+            Command::ForgetApp => {
+                if let Some(cancel) = self.app_login.take() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                self.api.disconnect(true).await;
+                self.app_connected = false;
+                self.send_app_status();
             }
             Command::LoadPlaylists => self.load_playlists(),
             Command::Open { view, force } => self.open(view, force),
@@ -621,11 +706,12 @@ impl Core {
                 self.login_cancel = None;
                 self.connect(Credentials::with_access_token(token), true);
             }
+            // A cancelled flow was replaced or abandoned on purpose: its handle is
+            // already gone and must not clear the one of a newer flow.
+            Internal::StreamingToken(Err(e)) if e.contains("annulée") => {}
             Internal::StreamingToken(Err(e)) => {
                 self.login_cancel = None;
-                if !e.contains("annulée") {
-                    self.ui.error(format!("Connexion impossible : {e}"));
-                }
+                self.ui.error(format!("Connexion impossible : {e}"));
                 if self.session.is_none() {
                     self.ui.send(Event::NeedLogin);
                 }
@@ -649,15 +735,21 @@ impl Core {
                     }
                 }
             }
-            Internal::PersonalToken(Ok((client_id, token))) => {
-                if let Some(api) = &self.api {
-                    api.set_personal(&client_id, token).await;
-                    self.ui.send(Event::Info("Application personnelle connectée.".into()));
+            Internal::AppToken(Err(e)) if e.contains("annulée") => {}
+            Internal::AppToken(result) => {
+                self.app_login = None;
+                match result {
+                    Ok((app, token)) => {
+                        self.api.connect(app, token).await;
+                        self.app_connected = true;
+                        self.refreshed.clear();
+                        self.ui.send(Event::Info("Application Spotify connectée.".into()));
+                        self.load_playlists();
+                        self.fetch_display_name();
+                    }
+                    Err(e) => self.ui.error(app_error_hint(&e)),
                 }
-                self.send_personal_state().await;
-            }
-            Internal::PersonalToken(Err(e)) => {
-                self.ui.error(format!("Autorisation de l'application personnelle impossible : {e}"));
+                self.send_app_status();
             }
             Internal::LikedIds(ids) => self.liked_ids = Some(ids),
             Internal::Playlists(list) => {
@@ -689,13 +781,11 @@ impl Core {
                 self.connect(credentials, false);
             }
         }
-        if let Some(api) = &self.api
-            && api.take_personal_lost()
-        {
-            self.ui.error(
-                "L'accès de votre application personnelle a expiré : reconnectez-la dans les réglages.",
-            );
-            self.ui.send(Event::PersonalApi(PersonalApi::Disconnected));
+        if self.api.take_lost() {
+            self.app_connected = false;
+            self.ui
+                .error("L'autorisation de votre application Spotify a expiré : cliquez sur « Reconnecter ».");
+            self.send_app_status();
         }
         if self.audio.as_ref().is_some_and(|a| a.player.is_invalid()) && !self.audio_failed {
             self.audio_failed = true;
@@ -722,14 +812,7 @@ impl Core {
     }
 
     async fn apply_settings(&mut self, new: Settings) {
-        let old = std::mem::replace(&mut self.settings, new);
-        if old.client_id != self.settings.client_id {
-            if let Some(api) = &self.api {
-                api.clear_personal().await;
-                api.load_personal(&self.settings.client_id).await;
-            }
-            self.send_personal_state().await;
-        }
+        self.settings = new;
         let audio_changed = self.audio.as_ref().is_some_and(|a| {
             a.quality != self.settings.quality || a.normalisation != self.settings.normalisation
         });
@@ -997,8 +1080,9 @@ impl Core {
     // ----------------------------------------------------------------------
     // Library
 
+    /// The Web API client, once the user's application is authorized.
     fn api(&self) -> Option<Arc<WebApi>> {
-        self.api.clone()
+        self.app_connected.then(|| self.api.clone())
     }
 
     fn remember_playlists(&mut self, list: &[PlaylistSummary]) {
@@ -1185,9 +1269,15 @@ impl Core {
                     });
                 }
                 ui.send(Event::Loading(view.clone()));
+                let session = self.session.clone();
                 tokio::spawn(async move {
                     match api.artist(&id).await {
-                        Ok((name, top, albums)) => {
+                        Ok((name, mut top, albums)) => {
+                            if top.is_empty()
+                                && let Some(session) = &session
+                            {
+                                top = artist_top_via_session(session, &id).await;
+                            }
                             store.save(
                                 &key,
                                 &CachedArtist {
@@ -1258,7 +1348,11 @@ impl Core {
             Some(event) => self.ui.send(event),
             None => self.ui.send(Event::ViewFailed {
                 view,
-                message: "Hors ligne : contenu non disponible dans le cache.".into(),
+                message: if self.app_connected {
+                    "Hors ligne : contenu non disponible dans le cache.".into()
+                } else {
+                    "Connectez votre application Spotify pour charger ce contenu.".into()
+                },
             }),
         }
     }
@@ -1343,8 +1437,23 @@ async fn next_player_event(audio: &mut Option<Audio>) -> Option<PlayerEvent> {
     }
 }
 
+/// Turns token endpoint errors into advice for the setup screen.
+fn app_error_hint(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("invalid_client") || lower.contains("invalid client") {
+        "Client ID ou Client Secret incorrect : recopiez-les depuis les réglages de votre application Spotify.".into()
+    } else if lower.contains("redirect") {
+        "URI de redirection refusée : ajoutez exactement celle affichée par SpotiLite dans votre application Spotify.".into()
+    } else if lower.contains("délai") {
+        "Aucune réponse du navigateur : vérifiez l'URI de redirection de votre application puis réessayez."
+            .into()
+    } else {
+        format!("Connexion de l'application impossible : {error}")
+    }
+}
+
 async fn run_flow(
-    flow: PkceFlow,
+    flow: AuthFlow,
     cancel: Arc<AtomicBool>,
     http: reqwest::Client,
 ) -> Result<auth::OAuthToken, String> {
@@ -1367,14 +1476,30 @@ fn album_event(view: ViewKey, cached: CachedAlbum) -> Event {
 }
 
 /// Reads a playlist through Spotify's streaming protocol (used when the Web API
-/// refuses it, e.g. playlists not owned by the user for personal applications).
+/// refuses it: development mode applications only read the user's own playlists).
 async fn playlist_via_session(session: &Session, id: &str) -> Result<Vec<Track>, String> {
     use librespot_metadata::{Metadata, Playlist};
     let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
     let playlist = Playlist::get(session, &uri).await.map_err(|e| e.to_string())?;
     let uris: Vec<SpotifyUri> =
         playlist.tracks().filter(|u| matches!(u, SpotifyUri::Track { .. })).cloned().collect();
-    let tracks = futures_util::stream::iter(uris)
+    Ok(tracks_via_session(session, uris).await)
+}
+
+/// Most popular tracks of an artist in the user's country, read through the
+/// streaming protocol (the Web API endpoint is closed to development mode apps).
+async fn artist_top_via_session(session: &Session, id: &str) -> Vec<Track> {
+    use librespot_metadata::{Artist, Metadata};
+    let Ok(uri) = SpotifyUri::from_uri(&format!("spotify:artist:{id}")) else { return Vec::new() };
+    let Ok(artist) = Artist::get(session, &uri).await else { return Vec::new() };
+    let top = artist.top_tracks.for_country(&session.country());
+    tracks_via_session(session, top.0.into_iter().take(10).collect()).await
+}
+
+/// Track metadata through the streaming protocol, 8 requests at a time.
+async fn tracks_via_session(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track> {
+    use librespot_metadata::Metadata;
+    futures_util::stream::iter(uris)
         .map(|uri| {
             let session = session.clone();
             async move {
@@ -1404,8 +1529,7 @@ async fn playlist_via_session(session: &Session, id: &str) -> Result<Vec<Track>,
         .buffered(8)
         .filter_map(std::future::ready)
         .collect::<Vec<_>>()
-        .await;
-    Ok(tracks)
+        .await
 }
 
 fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {

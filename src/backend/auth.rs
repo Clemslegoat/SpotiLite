@@ -1,7 +1,9 @@
-//! OAuth 2.0 "authorization code + PKCE" flow, completed in the user's browser.
+//! OAuth 2.0 authorization code flow, completed in the user's browser.
 //!
 //! No password ever goes through SpotiLite: Spotify's own login page is opened, and
-//! a tiny local HTTP listener on 127.0.0.1 receives the authorization code.
+//! a tiny local HTTP listener on 127.0.0.1 receives the authorization code. With a
+//! client secret the classic flow is used (HTTP Basic authentication of the app);
+//! without one, PKCE replaces the secret.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -11,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -31,7 +33,7 @@ pub const STREAMING_SCOPES: &[&str] = &[
     "user-modify-playback-state",
 ];
 
-/// Scopes requested for a personal Web API application.
+/// Scopes requested for the user's own Spotify application (library and search).
 pub const WEB_API_SCOPES: &[&str] = &[
     "user-read-private",
     "playlist-read-private",
@@ -65,6 +67,26 @@ impl std::fmt::Display for AuthError {
     }
 }
 
+/// The application created by the user on developer.spotify.com.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCredentials {
+    pub client_id: String,
+    /// May be empty: the PKCE flow is then used.
+    #[serde(default)]
+    pub client_secret: String,
+}
+
+impl AppCredentials {
+    fn secret(&self) -> Option<&str> {
+        Some(self.client_secret.as_str()).filter(|s| !s.is_empty())
+    }
+
+    /// Spotify ids and secrets are 32 hexadecimal characters.
+    pub fn looks_valid(value: &str) -> bool {
+        value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OAuthToken {
     pub access_token: String,
@@ -86,8 +108,8 @@ fn default_expiry() -> u64 {
 }
 
 /// A pending browser authorization.
-pub struct PkceFlow {
-    pub client_id: String,
+pub struct AuthFlow {
+    app: AppCredentials,
     pub redirect_uri: String,
     pub auth_url: String,
     verifier: String,
@@ -106,31 +128,33 @@ pub fn code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-impl PkceFlow {
+impl AuthFlow {
     /// Prepares the flow. `port = 0` picks a free port (allowed for Spotify's desktop
-    /// client id); a personal application needs the exact redirect URI it registered.
-    pub fn start(client_id: &str, port: u16, scopes: &[&str]) -> Result<Self, AuthError> {
+    /// client id); the user's application needs the exact redirect URI it registered.
+    pub fn start(app: AppCredentials, port: u16, scopes: &[&str]) -> Result<Self, AuthError> {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| AuthError::Bind(format!("127.0.0.1:{port} : {e}")))?;
         let port = listener.local_addr().map_err(|e| AuthError::Bind(e.to_string()))?.port();
         let redirect_uri = format!("http://127.0.0.1:{port}/login");
         let verifier = random_string(64);
         let state = random_string(16);
-        let auth_url = Url::parse_with_params(
-            AUTHORIZE_URL,
-            &[
-                ("response_type", "code"),
-                ("client_id", client_id),
-                ("redirect_uri", redirect_uri.as_str()),
-                ("code_challenge_method", "S256"),
-                ("code_challenge", code_challenge(&verifier).as_str()),
-                ("state", state.as_str()),
-                ("scope", scopes.join(" ").as_str()),
-            ],
-        )
-        .map_err(|e| AuthError::Exchange(e.to_string()))?
-        .to_string();
-        Ok(Self { client_id: client_id.to_string(), redirect_uri, auth_url, verifier, state, listener })
+        let challenge = code_challenge(&verifier);
+        let scope = scopes.join(" ");
+        let mut params = vec![
+            ("response_type", "code"),
+            ("client_id", app.client_id.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("state", state.as_str()),
+            ("scope", scope.as_str()),
+        ];
+        if app.secret().is_none() {
+            params.push(("code_challenge_method", "S256"));
+            params.push(("code_challenge", challenge.as_str()));
+        }
+        let auth_url = Url::parse_with_params(AUTHORIZE_URL, &params)
+            .map_err(|e| AuthError::Exchange(e.to_string()))?
+            .to_string();
+        Ok(Self { app, redirect_uri, auth_url, verifier, state, listener })
     }
 
     /// Blocks until the browser comes back (run it on a blocking thread).
@@ -195,14 +219,20 @@ impl PkceFlow {
     }
 
     pub async fn exchange(&self, http: &reqwest::Client, code: &str) -> Result<OAuthToken, AuthError> {
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("grant_type", "authorization_code")
-            .append_pair("code", code)
-            .append_pair("redirect_uri", &self.redirect_uri)
-            .append_pair("client_id", &self.client_id)
-            .append_pair("code_verifier", &self.verifier)
-            .finish();
-        post_token(http, body, None).await
+        // Built in its own scope: the serializer is not `Send` and must not live
+        // across the `.await`.
+        let body = {
+            let mut body = url::form_urlencoded::Serializer::new(String::new());
+            body.append_pair("grant_type", "authorization_code")
+                .append_pair("code", code)
+                .append_pair("redirect_uri", &self.redirect_uri);
+            if self.app.secret().is_none() {
+                body.append_pair("client_id", &self.app.client_id)
+                    .append_pair("code_verifier", &self.verifier);
+            }
+            body.finish()
+        };
+        post_token(http, &self.app, body, None).await
     }
 }
 
@@ -210,34 +240,54 @@ impl PkceFlow {
 /// in which case the previous one stays valid and is kept.
 pub async fn refresh(
     http: &reqwest::Client,
-    client_id: &str,
+    app: &AppCredentials,
     refresh_token: &str,
 ) -> Result<OAuthToken, AuthError> {
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("grant_type", "refresh_token")
-        .append_pair("refresh_token", refresh_token)
-        .append_pair("client_id", client_id)
-        .finish();
-    post_token(http, body, Some(refresh_token)).await
+    let body = {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.append_pair("grant_type", "refresh_token").append_pair("refresh_token", refresh_token);
+        if app.secret().is_none() {
+            body.append_pair("client_id", &app.client_id);
+        }
+        body.finish()
+    };
+    post_token(http, app, body, Some(refresh_token)).await
+}
+
+/// `Authorization: Basic base64(client_id:client_secret)`, as documented by Spotify.
+fn basic_auth(app: &AppCredentials) -> Option<String> {
+    let secret = app.secret()?;
+    let raw = format!("{}:{secret}", app.client_id);
+    Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(raw)))
 }
 
 async fn post_token(
     http: &reqwest::Client,
+    app: &AppCredentials,
     body: String,
     previous_refresh: Option<&str>,
 ) -> Result<OAuthToken, AuthError> {
-    let resp = http
+    let mut request = http
         .post(TOKEN_URL)
         .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| AuthError::Exchange(e.to_string()))?;
+        .body(body);
+    if let Some(header) = basic_auth(app) {
+        request = request.header(reqwest::header::AUTHORIZATION, header);
+    }
+    let resp = request.send().await.map_err(|e| AuthError::Exchange(e.to_string()))?;
     let status = resp.status();
     let bytes = resp.bytes().await.map_err(|e| AuthError::Exchange(e.to_string()))?;
     if !status.is_success() {
-        let text = String::from_utf8_lossy(&bytes);
-        return Err(AuthError::Exchange(format!("{status} {text}")));
+        let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("error_description")
+                    .or_else(|| v.get("error"))
+                    .and_then(|e| e.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+        return Err(AuthError::Exchange(format!("{} : {detail}", status.as_u16())));
     }
     let parsed: TokenResponse =
         serde_json::from_slice(&bytes).map_err(|e| AuthError::Exchange(e.to_string()))?;
@@ -254,9 +304,9 @@ async fn post_token(
 fn callback_page(title: &str, text: &str) -> String {
     format!(
         "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><title>SpotiLite</title>\
-<style>body{{margin:0;height:100vh;display:grid;place-items:center;background:#0f1115;color:#e8e6e3;\
-font:16px 'Segoe UI',system-ui,sans-serif}}h1{{font-weight:600;font-size:22px;margin:0 0 8px;color:#e8b04b}}\
-p{{margin:0;color:#8b93a1}}</style></head><body><div><h1>{title}</h1><p>{text}</p></div></body></html>"
+<style>body{{margin:0;height:100vh;display:grid;place-items:center;background:#000;color:#fff;\
+font:16px 'Segoe UI',system-ui,sans-serif}}h1{{font-weight:600;font-size:22px;margin:0 0 8px}}\
+p{{margin:0;color:#8a8a8a}}</style></head><body><div><h1>{title}</h1><p>{text}</p></div></body></html>"
     )
 }
 
@@ -273,9 +323,13 @@ mod tests {
         );
     }
 
+    fn app(id: &str, secret: &str) -> AppCredentials {
+        AppCredentials { client_id: id.into(), client_secret: secret.into() }
+    }
+
     #[test]
-    fn auth_url_contains_pkce_parameters() {
-        let flow = PkceFlow::start("abc", 0, &["streaming", "user-read-private"]).unwrap();
+    fn auth_url_contains_pkce_parameters_without_secret() {
+        let flow = AuthFlow::start(app("abc", ""), 0, &["streaming", "user-read-private"]).unwrap();
         let url = Url::parse(&flow.auth_url).unwrap();
         let get = |k: &str| url.query_pairs().find(|(q, _)| q == k).map(|(_, v)| v.into_owned());
         assert_eq!(get("client_id").as_deref(), Some("abc"));
@@ -286,8 +340,25 @@ mod tests {
     }
 
     #[test]
+    fn secret_uses_basic_auth_and_no_pkce() {
+        let flow = AuthFlow::start(app("abc", "s3cr3t"), 0, &["user-read-private"]).unwrap();
+        let url = Url::parse(&flow.auth_url).unwrap();
+        assert!(url.query_pairs().all(|(k, _)| k != "code_challenge"));
+        // base64("abc:s3cr3t")
+        assert_eq!(basic_auth(&app("abc", "s3cr3t")).as_deref(), Some("Basic YWJjOnMzY3IzdA=="));
+        assert_eq!(basic_auth(&app("abc", "")), None);
+    }
+
+    #[test]
+    fn validates_credential_format() {
+        assert!(AppCredentials::looks_valid("0123456789abcdef0123456789ABCDEF"));
+        assert!(!AppCredentials::looks_valid("0123456789abcdef"));
+        assert!(!AppCredentials::looks_valid("0123456789abcdef0123456789abcdeg"));
+    }
+
+    #[test]
     fn callback_listener_ignores_noise_and_returns_code() {
-        let flow = PkceFlow::start("abc", 0, &["streaming"]).unwrap();
+        let flow = AuthFlow::start(app("abc", ""), 0, &["streaming"]).unwrap();
         let port = flow.listener.local_addr().unwrap().port();
         let state = flow.state.clone();
         let client = std::thread::spawn(move || {

@@ -17,7 +17,8 @@ de lecture Spotify.
 |---|---|
 | **Léger** | Un seul `.exe` (~12 Mo) sans DLL à installer. Pas de moteur web : l'interface ne se redessine que lorsqu'il se passe quelque chose (au plus une fois par seconde pendant la lecture), donc le processeur reste au repos. |
 | **Économe en données** | Qualité **Éco 96 kbit/s par défaut** (≈ 43 Mo/heure), cache audio sur disque (un titre réécouté ne coûte rien), réponses de l'API compressées (gzip), bibliothèque mise en cache et resynchronisée seulement quand elle change, pochettes minuscules (64 px) et désactivables. |
-| **Sobre** | Thème maison minimaliste, sombre ou clair : listes typographiques, un seul accent ambré, aucune image décorative. |
+| **Sobre** | Thème **noir AMOLED** (pixels éteints sur les écrans OLED) avec le **blanc comme seul accent** : listes typographiques, gris neutres, aucune image décorative, barre de titre Windows sombre. |
+| **Votre propre quota** | Bibliothèque et recherche passent par **votre application Spotify** (créée en 2 minutes sur le tableau de bord développeur, guide intégré) : fini les erreurs « limite de requêtes » du jeton partagé. |
 | **Intégré à Windows** | Touches multimédia du clavier, panneau média de Windows (volume, écran de verrouillage), icône, pas de fenêtre console. |
 
 ## Fonctionnalités
@@ -67,29 +68,39 @@ vérifier d'un coup d'œil.
 Si Windows SmartScreen affiche un avertissement (exécutable non signé) : *Informations
 complémentaires* → *Exécuter quand même*.
 
-### Première connexion
+### Première connexion (2 étapes)
 
-Cliquez sur **Se connecter avec Spotify** : la page de connexion officielle de Spotify s'ouvre
-dans votre navigateur. Une fois l'accès autorisé, revenez à SpotiLite. Aucun mot de passe ne
-transite par l'application ; seul un jeton de session est conservé localement pour les
-lancements suivants. **Un compte Premium est obligatoire** (Spotify n'autorise pas la lecture
-par des clients tiers pour les comptes gratuits).
+**1. Votre compte.** Cliquez sur **Se connecter avec Spotify** : la page de connexion officielle
+de Spotify s'ouvre dans votre navigateur. Aucun mot de passe ne transite par SpotiLite ; seul un
+jeton de session est conservé pour les lancements suivants. **Un compte Premium est
+obligatoire** (Spotify n'autorise pas la lecture par des clients tiers pour les comptes gratuits).
 
-### Application personnelle (facultatif, recommandé en cas d'erreurs « limite les requêtes »)
+**2. Votre application Spotify.** SpotiLite affiche ensuite un mini-guide, à suivre une seule fois :
 
-Par défaut, les données de la bibliothèque passent par le jeton de votre session d'écoute. Ce
-type de jeton est partagé par tous les lecteurs basés sur librespot et Spotify le limite
-parfois (erreur 429). Pour un quota dédié :
+![Écran de configuration](docs/configuration.png)
 
-1. Ouvrez <https://developer.spotify.com/dashboard> et créez une application (gratuit ;
-   Spotify exige un compte Premium pour cela, ce que vous avez déjà).
-2. Dans *Redirect URIs*, ajoutez exactement `http://127.0.0.1:8898/login` et cochez *Web API*.
-3. Copiez le *Client ID* dans **Réglages → API Web Spotify**, cliquez sur **Enregistrer** puis
-   sur **Autoriser l'application**.
+1. Ouvrez le [tableau de bord Spotify](https://developer.spotify.com/dashboard) et cliquez sur
+   **Create app** (gratuit ; Spotify exige un compte Premium, ce que vous avez déjà).
+2. Nom et description : au choix, par exemple « SpotiLite ».
+3. Dans **Redirect URIs**, ajoutez exactement `http://127.0.0.1:8898/login` (bouton *Copier* dans
+   l'app) puis **Add**.
+4. Cochez **Web API**, acceptez les conditions, **Save**.
+5. Dans **Settings**, copiez le **Client ID** et le **Client Secret** (*View client secret*),
+   collez-les dans SpotiLite puis cliquez sur **Connecter** et acceptez dans le navigateur.
 
-Remarque : les applications personnelles (mode « développement ») ne peuvent lire que les
-playlists dont vous êtes propriétaire ou collaborateur. Pour les autres, SpotiLite bascule
-automatiquement sur le protocole de lecture de Spotify : elles restent accessibles.
+Si vous écoutez avec un autre compte Spotify que celui du tableau de bord, ajoutez-le dans
+**User Management**. Le Client Secret est facultatif (sans lui, SpotiLite utilise PKCE).
+
+Pourquoi ? Le jeton de la session d'écoute est partagé par tous les lecteurs basés sur
+librespot et Spotify le limite très vite (erreur 429). Votre application a son propre quota.
+Les applications en mode « développement » ne peuvent lire que les playlists dont vous êtes
+propriétaire ou collaborateur, et ne donnent plus les titres populaires d'un artiste : pour ces
+deux cas, SpotiLite passe automatiquement par le protocole de lecture de Spotify.
+
+**Sécurité** : le Client Secret et le jeton d'accès sont chiffrés par Windows (DPAPI) : seule
+votre session Windows, sur ce PC, peut les lire. Ils ne sont envoyés qu'à Spotify.
+*Réglages → Application Spotify* permet de modifier les identifiants, de changer le port de
+l'URI de redirection ou d'oublier l'application.
 
 ## Raccourcis clavier
 
@@ -108,11 +119,12 @@ automatiquement sur le protocole de lecture de Spotify : elles restent accessibl
 
 ## Fichiers
 
-- Réglages et jeton de session : `%APPDATA%\SpotiLite`
+- Réglages, jeton de session et identifiants de l'application (chiffrés) : `%APPDATA%\SpotiLite`
 - Caches (audio, bibliothèque, pochettes) et journal `spotilite.log` : `%LOCALAPPDATA%\SpotiLite`
 - **Mode portable** : créez un dossier `spotilite-data` à côté de `SpotiLite.exe` ; tout y sera
   enregistré.
-- *Réglages → Se déconnecter* supprime le jeton et les caches de bibliothèque.
+- *Réglages → Se déconnecter* supprime le jeton de session et les caches de bibliothèque
+  (les identifiants de l'application restent, pour se reconnecter en un clic).
 
 ## Limites connues
 
@@ -136,7 +148,8 @@ Compilation croisée depuis Linux : `rustup target add x86_64-pc-windows-gnu`, i
 `mingw-w64`, puis `cargo build --release --target x86_64-pc-windows-gnu`.
 
 Tests : `cargo test`. En build de debug, `SPOTILITE_DEMO=1` affiche l'interface avec des
-données fictives (utile pour travailler sur l'interface sans compte).
+données fictives (utile pour travailler sur l'interface sans compte) ; ajoutez
+`SPOTILITE_DEMO_SETUP=1` pour l'écran de configuration.
 
 ### Architecture
 
@@ -146,8 +159,9 @@ src/
 ├── ui/              interface egui (thème, vues, widgets et icônes vectorielles)
 ├── backend/         thread réseau/audio (Tokio, 2 threads)
 │   ├── mod.rs       session librespot, lecteur, commandes, cache de bibliothèque
-│   ├── auth.rs      OAuth 2.0 PKCE dans le navigateur
+│   ├── auth.rs      OAuth 2.0 dans le navigateur (Client Secret ou PKCE)
 │   ├── webapi.rs    client minimal de l'API Web (gzip, pagination, reprise sur 429)
+│   ├── vault.rs     secrets chiffrés avec DPAPI sous Windows
 │   └── store.rs     cache disque (JSON et vignettes)
 ├── queue.rs         file de lecture locale (aléatoire, répétition, ajouts)
 ├── media.rs         touches multimédia et panneau média de Windows

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers, TextureHandle, TextureOptions};
 
-use crate::backend::{Backend, Command, Event, PersonalApi};
+use crate::backend::{AppState, AppStatus, Backend, Command, Event};
 use crate::config::{Paths, Settings};
 use crate::media::MediaKeys;
 use crate::model::{AlbumSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
@@ -104,7 +104,8 @@ pub struct App {
     palette: Palette,
     auth: Auth,
     user: String,
-    personal: PersonalApi,
+    /// The user's own Spotify application (library, search).
+    app_status: AppStatus,
     playlists: Vec<PlaylistSummary>,
     view: ViewKey,
     history: Vec<ViewKey>,
@@ -126,7 +127,12 @@ pub struct App {
     memory_at: Option<Instant>,
     media: MediaKeys,
     minimized: bool,
-    client_id_draft: String,
+    /// Setup form.
+    setup_id: String,
+    setup_secret: String,
+    show_secret: bool,
+    /// The user asked to change the application from the settings.
+    editing_app: bool,
     port_draft: String,
     /// Debug builds only: fake data for UI work without a Spotify account.
     demo: bool,
@@ -136,7 +142,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, settings: Settings) -> Self {
         let ctx = &cc.egui_ctx;
         theme::install_fonts(ctx);
-        let palette = Palette::for_choice(settings.theme);
+        let palette = Palette::amoled();
         theme::apply(ctx, &palette);
         ctx.set_zoom_factor(settings.ui_scale);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
@@ -146,13 +152,16 @@ impl App {
         let player = Player { shuffle: settings.shuffle, repeat: settings.repeat, ..Player::default() };
         Self {
             backend,
-            client_id_draft: settings.client_id.clone(),
+            setup_id: String::new(),
+            setup_secret: String::new(),
+            show_secret: false,
+            editing_app: false,
             port_draft: settings.redirect_port.to_string(),
             paths,
             palette,
             auth: Auth::Unknown,
             user: String::new(),
-            personal: PersonalApi::NotConfigured,
+            app_status: AppStatus { state: AppState::Unknown, client_id: String::new(), has_secret: false },
             playlists: Vec::new(),
             view: ViewKey::Welcome,
             history: Vec::new(),
@@ -225,6 +234,11 @@ impl App {
         self.player.at = Some(Instant::now());
         self.player.liked.insert(tracks[2].id.clone(), true);
         self.player.upcoming = tracks[3..12].to_vec();
+        self.app_status.state = if std::env::var_os("SPOTILITE_DEMO_SETUP").is_some() {
+            AppState::NotConfigured
+        } else {
+            AppState::Connected
+        };
         self.view = ViewKey::Liked;
         self.pages.insert(
             ViewKey::Liked,
@@ -338,7 +352,7 @@ impl App {
                     self.navigate(ViewKey::Liked);
                 }
             }
-            Event::PersonalApi(state) => self.personal = state,
+            Event::App(status) => self.on_app_status(status),
             Event::Playlists(list) => self.playlists = list,
             Event::Loading(view) => {
                 self.failures.remove(&view);
@@ -395,7 +409,7 @@ impl App {
         }
     }
 
-    fn toast(&mut self, text: String, error: bool) {
+    pub(super) fn toast(&mut self, text: String, error: bool) {
         if error {
             log::warn!("{text}");
         }
@@ -444,9 +458,37 @@ impl App {
         self.send(Command::SetVolume(self.settings.volume));
     }
 
+    fn on_app_status(&mut self, status: AppStatus) {
+        let connected_now =
+            status.state == AppState::Connected && self.app_status.state != AppState::Connected;
+        if self.setup_id.is_empty() {
+            self.setup_id = status.client_id.clone();
+        }
+        self.app_status = status;
+        if connected_now {
+            // Everything that failed while the application was missing loads now.
+            self.editing_app = false;
+            self.setup_secret.clear();
+            self.failures.clear();
+            self.loading.clear();
+            if self.view == ViewKey::Welcome {
+                self.navigate(ViewKey::Liked);
+            } else if !matches!(self.view, ViewKey::Settings | ViewKey::Queue) {
+                self.send(Command::Open { view: self.view.clone(), force: false });
+            }
+        }
+    }
+
+    /// The setup screen replaces the library until the user's application works.
+    pub fn needs_setup(&self) -> bool {
+        self.editing_app
+            || matches!(
+                self.app_status.state,
+                AppState::NotConfigured | AppState::Disconnected | AppState::Authorizing
+            )
+    }
+
     fn apply_settings(&mut self, ctx: &egui::Context) {
-        self.palette = Palette::for_choice(self.settings.theme);
-        theme::apply(ctx, &self.palette);
         ctx.set_zoom_factor(self.settings.ui_scale);
         self.settings.save(&self.paths);
         self.send(Command::ApplySettings(Box::new(self.settings.clone())));
@@ -628,6 +670,7 @@ impl eframe::App for App {
             self.settings.window_size = [rect.width() * ctx.zoom_factor(), rect.height() * ctx.zoom_factor()];
         }
         match self.auth {
+            Auth::LoggedIn | Auth::Offline if self.needs_setup() => views::setup_screen(self, ui),
             Auth::LoggedIn | Auth::Offline => views::main_layout(self, ui),
             _ => views::login_screen(self, ui),
         }

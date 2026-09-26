@@ -6,19 +6,19 @@
 //! * results are immediately reduced to the compact structs of [`crate::model`].
 
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use librespot_core::session::Session;
 use reqwest::Method;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RETRY_AFTER};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::auth::{self, OAuthToken};
-use crate::config::{Paths, write_atomic};
+use super::auth::{self, AppCredentials, OAuthToken};
+use super::vault;
+use crate::config::Paths;
 use crate::model::{AlbumSummary, ArtistRef, ArtistSummary, PlaylistSummary, SearchResults, Track};
 
 const API: &str = "https://api.spotify.com/v1";
@@ -27,8 +27,9 @@ const MAX_ITEMS: usize = 20_000;
 
 #[derive(Debug)]
 pub enum ApiError {
+    /// No authorized Spotify application yet (setup screen).
+    NotConnected,
     Network(String),
-    Auth(String),
     RateLimited(u64),
     Forbidden(String),
     NotFound,
@@ -39,8 +40,8 @@ pub enum ApiError {
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ApiError::NotConnected => write!(f, "application Spotify non connectée"),
             ApiError::Network(e) => write!(f, "réseau indisponible ({e})"),
-            ApiError::Auth(e) => write!(f, "authentification refusée ({e})"),
             ApiError::RateLimited(s) => {
                 write!(f, "Spotify limite les requêtes, réessayez dans {s} s")
             }
@@ -54,9 +55,9 @@ impl std::fmt::Display for ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
-/// Personal application credentials (optional, see README).
-struct Personal {
-    client_id: String,
+/// The user's Spotify application and its current token.
+struct Connection {
+    app: AppCredentials,
     token: OAuthToken,
 }
 
@@ -66,124 +67,107 @@ struct StoredToken {
     refresh_token: String,
 }
 
+/// Every Web API call goes through the application the user created on
+/// developer.spotify.com: its quota is not shared with anybody else.
 pub struct WebApi {
     http: reqwest::Client,
-    session: Mutex<Session>,
-    personal: tokio::sync::Mutex<Option<Personal>>,
-    personal_lost: AtomicBool,
+    connection: tokio::sync::Mutex<Option<Connection>>,
+    lost: AtomicBool,
     paths: Paths,
     bytes: Arc<AtomicU64>,
 }
 
 impl WebApi {
-    pub fn new(http: reqwest::Client, session: Session, paths: Paths, bytes: Arc<AtomicU64>) -> Self {
-        Self {
-            http,
-            session: Mutex::new(session),
-            personal: tokio::sync::Mutex::new(None),
-            personal_lost: AtomicBool::new(false),
-            paths,
-            bytes,
+    pub fn new(http: reqwest::Client, paths: Paths, bytes: Arc<AtomicU64>) -> Self {
+        Self { http, connection: tokio::sync::Mutex::new(None), lost: AtomicBool::new(false), paths, bytes }
+    }
+
+    /// Credentials saved by the setup screen, if any.
+    pub fn saved_app(&self) -> Option<AppCredentials> {
+        vault::load::<AppCredentials>(&self.paths.app_file()).filter(|a| !a.client_id.is_empty())
+    }
+
+    pub fn save_app(&self, app: &AppCredentials) {
+        if let Err(e) = vault::save(&self.paths.app_file(), app) {
+            log::warn!("could not save app credentials: {e}");
         }
     }
 
-    pub fn set_session(&self, session: Session) {
-        *self.session.lock().unwrap() = session;
-    }
-
-    fn session(&self) -> Session {
-        self.session.lock().unwrap().clone()
-    }
-
-    /// Restores the personal application token saved by a previous run, if it matches
-    /// the configured client id.
-    pub async fn load_personal(&self, client_id: &str) -> bool {
-        let mut personal = self.personal.lock().await;
-        *personal = None;
-        if client_id.is_empty() {
-            return false;
-        }
-        let Some(stored) = std::fs::read(self.paths.web_token_file())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<StoredToken>(&b).ok())
-            .filter(|s| s.client_id == client_id)
+    /// Restores the authorization saved by a previous run.
+    pub async fn restore(&self) -> bool {
+        let mut connection = self.connection.lock().await;
+        *connection = None;
+        let Some(app) = self.saved_app() else { return false };
+        let Some(stored) =
+            vault::load::<StoredToken>(&self.paths.web_token_file()).filter(|s| s.client_id == app.client_id)
         else {
             return false;
         };
-        *personal = Some(Personal {
-            client_id: stored.client_id,
-            token: OAuthToken {
-                access_token: String::new(),
-                refresh_token: Some(stored.refresh_token),
-                expires_at: Instant::now(),
-            },
-        });
+        let token = OAuthToken {
+            access_token: String::new(),
+            refresh_token: Some(stored.refresh_token),
+            expires_at: Instant::now(),
+        };
+        *connection = Some(Connection { app, token });
         true
     }
 
-    pub async fn set_personal(&self, client_id: &str, token: OAuthToken) {
-        self.save_personal(client_id, &token);
-        *self.personal.lock().await = Some(Personal { client_id: client_id.to_string(), token });
+    pub async fn connect(&self, app: AppCredentials, token: OAuthToken) {
+        self.save_token(&app, &token);
+        self.lost.store(false, Ordering::Relaxed);
+        *self.connection.lock().await = Some(Connection { app, token });
     }
 
-    pub async fn clear_personal(&self) {
-        *self.personal.lock().await = None;
+    /// Forgets the authorization (and, with `forget_app`, the credentials too).
+    pub async fn disconnect(&self, forget_app: bool) {
+        *self.connection.lock().await = None;
         let _ = std::fs::remove_file(self.paths.web_token_file());
+        if forget_app {
+            let _ = std::fs::remove_file(self.paths.app_file());
+        }
     }
 
-    pub async fn has_personal(&self) -> bool {
-        self.personal.lock().await.is_some()
+    /// True once if the authorization stopped working (revoked, expired…).
+    pub fn take_lost(&self) -> bool {
+        self.lost.swap(false, Ordering::Relaxed)
     }
 
-    /// True once if the personal token stopped working (e.g. expired refresh token).
-    pub fn take_personal_lost(&self) -> bool {
-        self.personal_lost.swap(false, Ordering::Relaxed)
-    }
-
-    fn save_personal(&self, client_id: &str, token: &OAuthToken) {
+    fn save_token(&self, app: &AppCredentials, token: &OAuthToken) {
         let Some(refresh_token) = token.refresh_token.clone() else { return };
-        let stored = StoredToken { client_id: client_id.to_string(), refresh_token };
-        if let Ok(bytes) = serde_json::to_vec(&stored)
-            && let Err(e) = write_atomic(&self.paths.web_token_file(), &bytes)
-        {
+        let stored = StoredToken { client_id: app.client_id.clone(), refresh_token };
+        if let Err(e) = vault::save(&self.paths.web_token_file(), &stored) {
             log::warn!("could not save web api token: {e}");
         }
     }
 
     async fn token(&self) -> ApiResult<String> {
-        {
-            let mut guard = self.personal.lock().await;
-            if let Some(personal) = guard.as_mut() {
-                if Instant::now() < personal.token.expires_at {
-                    return Ok(personal.token.access_token.clone());
-                }
-                let refresh = personal.token.refresh_token.clone().unwrap_or_default();
-                match auth::refresh(&self.http, &personal.client_id, &refresh).await {
-                    Ok(token) => {
-                        self.save_personal(&personal.client_id, &token);
-                        personal.token = token;
-                        return Ok(personal.token.access_token.clone());
-                    }
-                    Err(e) => {
-                        log::warn!("personal token refresh failed, falling back to session: {e}");
-                        *guard = None;
-                        let _ = std::fs::remove_file(self.paths.web_token_file());
-                        self.personal_lost.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else { return Err(ApiError::NotConnected) };
+        if Instant::now() < connection.token.expires_at {
+            return Ok(connection.token.access_token.clone());
         }
-        let session = self.session();
-        let token = tokio::time::timeout(Duration::from_secs(10), session.login5().auth_token())
-            .await
-            .map_err(|_| ApiError::Auth("délai dépassé".into()))?
-            .map_err(|e| ApiError::Auth(e.to_string()))?;
-        Ok(token.access_token)
+        let refresh = connection.token.refresh_token.clone().unwrap_or_default();
+        match auth::refresh(&self.http, &connection.app, &refresh).await {
+            Ok(token) => {
+                self.save_token(&connection.app, &token);
+                connection.token = token;
+                Ok(connection.token.access_token.clone())
+            }
+            Err(auth::AuthError::Exchange(e)) if e.starts_with("400") || e.starts_with("401") => {
+                // Refresh token revoked or expired (Spotify expires them after 6 months).
+                log::warn!("web api authorization lost: {e}");
+                *guard = None;
+                let _ = std::fs::remove_file(self.paths.web_token_file());
+                self.lost.store(true, Ordering::Relaxed);
+                Err(ApiError::NotConnected)
+            }
+            Err(e) => Err(ApiError::Network(e.to_string())),
+        }
     }
 
     async fn invalidate_token(&self) {
-        if let Some(personal) = self.personal.lock().await.as_mut() {
-            personal.token.expires_at = Instant::now();
+        if let Some(connection) = self.connection.lock().await.as_mut() {
+            connection.token.expires_at = Instant::now();
         }
     }
 
@@ -284,8 +268,8 @@ impl WebApi {
         self.paged(format!("{API}/me/playlists?limit=50"), playlist_from).await
     }
 
-    /// Tracks of a playlist. Personal (development mode) applications can only read
-    /// playlists owned by the user: the caller falls back to the streaming protocol.
+    /// Tracks of a playlist. Development mode applications can only read playlists
+    /// owned by the user (or shared with them): the caller then falls back to the streaming protocol.
     pub async fn playlist_tracks(&self, id: &str) -> ApiResult<Vec<Track>> {
         let url = format!("{API}/playlists/{id}/items?limit=50&market=from_token&additional_types=track");
         self.paged(url, |item| {
@@ -629,6 +613,37 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn saves_restores_and_forgets_the_application() {
+        let dir = std::env::temp_dir().join(format!("spotilite-webapi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths { config: dir.clone(), cache: dir.join("cache") };
+        let api = WebApi::new(reqwest::Client::new(), paths, Arc::new(AtomicU64::new(0)));
+        assert!(!api.restore().await);
+        assert!(matches!(api.me().await, Err(ApiError::NotConnected)));
+
+        let app = AppCredentials { client_id: "a".repeat(32), client_secret: "b".repeat(32) };
+        api.save_app(&app);
+        assert_eq!(api.saved_app(), Some(app.clone()));
+        assert!(!api.restore().await, "no authorization yet");
+
+        let token = OAuthToken {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: Instant::now() + Duration::from_secs(600),
+        };
+        api.connect(app.clone(), token).await;
+        assert!(api.restore().await, "authorization survives a restart");
+
+        api.disconnect(false).await;
+        assert!(!api.restore().await);
+        assert_eq!(api.saved_app(), Some(app), "credentials are kept");
+        api.disconnect(true).await;
+        assert_eq!(api.saved_app(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn track_json(id: &str) -> Value {
         json!({

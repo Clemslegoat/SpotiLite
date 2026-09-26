@@ -10,8 +10,8 @@ use eframe::egui::{
 use super::theme::{self, PLAYER_HEIGHT, ROW_HEIGHT, SIDEBAR_WIDTH};
 use super::widgets::{self, Icon, format_duration, format_total, paint_text};
 use super::{App, Auth, Page};
-use crate::backend::{Command, PersonalApi, human_bytes};
-use crate::config::{Quality, ThemeChoice};
+use crate::backend::{AppCredentials, AppState, Command, human_bytes};
+use crate::config::Quality;
 use crate::model::{AlbumSummary, PlaylistSummary, Repeat, Track, ViewKey};
 
 // ----------------------------------------------------------------------------
@@ -556,7 +556,9 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
     }
 
     let mut x = rect.left() + cols.index;
-    paint_text(ui, pos2(x, y), &track.name, theme::body_font(), text_color, cols.title - 12.0);
+    // The playing track stands out by weight, not by color (white is the only accent).
+    let title_font = if is_current { theme::strong_font(14.0) } else { theme::body_font() };
+    paint_text(ui, pos2(x, y), &track.name, title_font, text_color, cols.title - 12.0);
     x += cols.title;
 
     // Artist and album are links.
@@ -944,6 +946,53 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
     ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
         ui.set_max_width(640.0);
 
+        card(ui, &p, "Application Spotify", |ui| {
+            let status = app.app_status.clone();
+            let id = mask_id(&status.client_id);
+            let text = match status.state {
+                AppState::Connected if status.has_secret => format!("Connectée · Client ID {id} · secret enregistré"),
+                AppState::Connected => format!("Connectée · Client ID {id}"),
+                AppState::Authorizing => "En attente de votre accord dans le navigateur…".to_string(),
+                AppState::Disconnected => format!("Autorisation expirée ou révoquée · Client ID {id}"),
+                _ => "Aucune application configurée".to_string(),
+            };
+            ui.label(RichText::new(text).color(p.text));
+            ui.label(
+                RichText::new("Elle sert à la bibliothèque et à la recherche ; la lecture audio passe par votre compte.")
+                    .small()
+                    .color(p.faint),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if status.state == AppState::Disconnected && widgets::pill(ui, &p, "Reconnecter", true).clicked() {
+                    app.send(Command::ReconnectApp);
+                }
+                if widgets::pill(ui, &p, "Modifier les identifiants", false).clicked() {
+                    app.editing_app = true;
+                    app.setup_id = status.client_id.clone();
+                    app.setup_secret.clear();
+                }
+                if !status.client_id.is_empty() && widgets::pill(ui, &p, "Oublier l'application", false).clicked() {
+                    app.send(Command::ForgetApp);
+                    app.setup_id.clear();
+                    app.setup_secret.clear();
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Port de l'URI de redirection").color(p.dim));
+                ui.add(egui::TextEdit::singleline(&mut app.port_draft).desired_width(64.0));
+                let draft = app.port_draft.trim().parse::<u16>().ok().filter(|port| *port >= 1024);
+                if let Some(port) = draft.filter(|port| *port != app.settings.redirect_port)
+                    && widgets::pill(ui, &p, "Enregistrer", true).clicked()
+                {
+                    app.settings.redirect_port = port;
+                    changed = true;
+                    app.toast(format!("Pensez à déclarer http://127.0.0.1:{port}/login dans votre application Spotify."), false);
+                }
+            });
+        });
+
         card(ui, &p, "Économie de données", |ui| {
             ui.label(RichText::new("Qualité audio").color(p.text));
             for quality in Quality::ALL {
@@ -988,11 +1037,7 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
                 .changed();
         });
 
-        card(ui, &p, "Apparence", |ui| {
-            ui.horizontal(|ui| {
-                changed |= ui.radio_value(&mut app.settings.theme, ThemeChoice::Dark, "Sombre").changed();
-                changed |= ui.radio_value(&mut app.settings.theme, ThemeChoice::Light, "Clair").changed();
-            });
+        card(ui, &p, "Affichage", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Taille du texte");
                 for (scale, label) in [(0.9, "90 %"), (1.0, "100 %"), (1.15, "115 %"), (1.3, "130 %")] {
@@ -1013,59 +1058,6 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
             changed |= ui
                 .checkbox(&mut app.settings.trim_when_minimized, "Libérer la mémoire quand la fenêtre est réduite")
                 .changed();
-        });
-
-        card(ui, &p, "API Web Spotify (facultatif)", |ui| {
-            ui.label(
-                RichText::new(
-                    "Par défaut, SpotiLite utilise le jeton de votre session. Spotify limite parfois ce jeton partagé \
-                     (erreur « limite les requêtes »). Pour un accès dédié, créez une application gratuite sur \
-                     developer.spotify.com, ajoutez l'URI de redirection ci-dessous puis collez son Client ID.",
-                )
-                .color(p.dim),
-            );
-            ui.hyperlink_to("Ouvrir le tableau de bord développeur", "https://developer.spotify.com/dashboard");
-            ui.add_space(6.0);
-            egui::Grid::new("api-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Client ID");
-                ui.add(egui::TextEdit::singleline(&mut app.client_id_draft).desired_width(300.0).hint_text("32 caractères"));
-                ui.end_row();
-                ui.label("Port de redirection");
-                ui.add(egui::TextEdit::singleline(&mut app.port_draft).desired_width(80.0));
-                ui.end_row();
-                ui.label("URI à déclarer");
-                let port: u16 = app.port_draft.trim().parse().unwrap_or(app.settings.redirect_port);
-                ui.label(RichText::new(format!("http://127.0.0.1:{port}/login")).monospace());
-                ui.end_row();
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let draft_id = app.client_id_draft.trim().to_string();
-                let draft_port = app.port_draft.trim().parse::<u16>().ok().filter(|p| *p > 0);
-                let dirty = draft_id != app.settings.client_id || draft_port.is_some_and(|port| port != app.settings.redirect_port);
-                if dirty && widgets::pill(ui, &p, "Enregistrer", true).clicked() {
-                    app.settings.client_id = draft_id;
-                    if let Some(port) = draft_port {
-                        app.settings.redirect_port = port;
-                    }
-                    changed = true;
-                }
-                if !dirty && !app.settings.client_id.is_empty() {
-                    match app.personal {
-                        PersonalApi::Connected => {
-                            ui.label(RichText::new("● Connectée").color(p.accent));
-                            if widgets::pill(ui, &p, "Déconnecter", false).clicked() {
-                                app.send(Command::DisconnectPersonalApi);
-                            }
-                        }
-                        _ => {
-                            if widgets::pill(ui, &p, "Autoriser l'application", true).clicked() {
-                                app.send(Command::ConnectPersonalApi);
-                            }
-                        }
-                    }
-                }
-            });
         });
 
         card(ui, &p, "Compte", |ui| {
@@ -1110,6 +1102,257 @@ fn card(ui: &mut Ui, p: &theme::Palette, title: &str, add: impl FnOnce(&mut Ui))
 }
 
 // ----------------------------------------------------------------------------
+// Setup of the user's Spotify application
+
+const DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
+
+/// Full-page setup: a micro guide to create the application on Spotify's
+/// dashboard, then the Client ID / Client Secret form.
+pub fn setup_screen(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    egui::CentralPanel::default().frame(Frame::new().fill(p.bg)).show(ui, |ui| {
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Two columns on a wide window so the form stays visible without scrolling.
+            let wide = ui.available_width() >= 900.0;
+            let width = if wide {
+                (ui.available_width() - 80.0).min(1040.0)
+            } else {
+                (ui.available_width() - 40.0).clamp(280.0, 580.0)
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - width) / 2.0).max(16.0));
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    setup_header(app, ui);
+                    if wide {
+                        ui.columns(2, |columns| {
+                            setup_guide(app, &mut columns[0]);
+                            setup_form(app, &mut columns[1]);
+                            setup_footer(app, &mut columns[1]);
+                        });
+                    } else {
+                        setup_guide(app, ui);
+                        setup_form(app, ui);
+                        setup_footer(app, ui);
+                    }
+                });
+            });
+        });
+    });
+}
+
+fn setup_header(app: &App, ui: &mut Ui) {
+    let p = app.palette;
+    ui.add_space(28.0);
+    ui.label(RichText::new("Votre application Spotify").font(theme::heading_font()).color(p.text));
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "SpotiLite charge votre bibliothèque et la recherche avec votre propre application Spotify : \
+             un quota rien que pour vous, fini les erreurs « limite de requêtes ».",
+        )
+        .color(p.dim),
+    );
+    ui.add_space(16.0);
+}
+
+fn setup_guide(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    let redirect = format!("http://127.0.0.1:{}/login", app.settings.redirect_port);
+    card(ui, &p, "Créer l'application (2 minutes)", |ui| {
+        step(ui, &p, 1, |ui| {
+            ui.label(
+                RichText::new("Ouvrez le tableau de bord Spotify et cliquez sur « Create app ».")
+                    .color(p.text),
+            );
+            ui.add_space(4.0);
+            if widgets::pill(ui, &p, "Ouvrir le tableau de bord", false).clicked() {
+                let _ = open::that_detached(DASHBOARD_URL);
+            }
+        });
+        step(ui, &p, 2, |ui| {
+            ui.label(
+                RichText::new("Nom et description : au choix, par exemple « SpotiLite ».").color(p.text),
+            );
+        });
+        step(ui, &p, 3, |ui| {
+            ui.label(
+                RichText::new(
+                    "Dans « Redirect URIs », collez exactement cette adresse puis cliquez sur « Add » :",
+                )
+                .color(p.text),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                Frame::new()
+                    .fill(p.raised)
+                    .corner_radius(CornerRadius::same(5))
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&redirect).monospace().color(p.accent));
+                    });
+                if widgets::pill(ui, &p, "Copier", false).clicked() {
+                    ui.ctx().copy_text(redirect.clone());
+                    app.toast("Adresse copiée.".into(), false);
+                }
+            });
+        });
+        step(ui, &p, 4, |ui| {
+            ui.label(
+                RichText::new("Cochez « Web API », acceptez les conditions puis cliquez sur « Save ».")
+                    .color(p.text),
+            );
+        });
+        step(ui, &p, 5, |ui| {
+            ui.label(
+                RichText::new(
+                    "Ouvrez « Settings » : copiez le Client ID, puis le Client Secret (« View client secret »), \
+                     et collez-les dans « Identifiants ».",
+                )
+                .color(p.text),
+            );
+        });
+        ui.label(
+            RichText::new(
+                "Vous écoutez avec un autre compte que celui du tableau de bord ? Ajoutez-le dans « User Management ».",
+            )
+            .small()
+            .color(p.faint),
+        );
+    });
+}
+
+fn setup_form(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    let status = app.app_status.clone();
+    card(ui, &p, "Identifiants", |ui| {
+        let keeps_secret =
+            status.has_secret && app.setup_id.trim() == status.client_id && !status.client_id.is_empty();
+        ui.label(RichText::new("Client ID").color(p.dim));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.setup_id)
+                .hint_text("32 caractères")
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace)
+                .margin(Margin::symmetric(8, 6)),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Client Secret").color(p.dim));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if app.show_secret { "MASQUER" } else { "AFFICHER" };
+                if widgets::text_toggle(ui, &p, label, false, 0.0).clicked() {
+                    app.show_secret = !app.show_secret;
+                }
+            });
+        });
+        let hint =
+            if keeps_secret { "enregistré — laissez vide pour le conserver" } else { "32 caractères" };
+        ui.add(
+            egui::TextEdit::singleline(&mut app.setup_secret)
+                .password(!app.show_secret)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace)
+                .margin(Margin::symmetric(8, 6)),
+        );
+        let id = app.setup_id.trim().to_string();
+        let secret = app.setup_secret.trim().to_string();
+        let id_ok = AppCredentials::looks_valid(&id);
+        let secret_ok = AppCredentials::looks_valid(&secret) || (secret.is_empty() && keeps_secret);
+        if !id.is_empty() && !id_ok {
+            ui.label(
+                RichText::new("Le Client ID fait 32 caractères (chiffres et lettres a à f).")
+                    .small()
+                    .color(p.dim),
+            );
+        }
+        if !secret.is_empty() && !AppCredentials::looks_valid(&secret) {
+            ui.label(
+                RichText::new("Le Client Secret fait 32 caractères (chiffres et lettres a à f).")
+                    .small()
+                    .color(p.dim),
+            );
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if status.state == AppState::Authorizing {
+                ui.add(egui::Spinner::new().color(p.accent));
+                ui.label(RichText::new("Acceptez l'accès dans votre navigateur…").color(p.text));
+                if widgets::pill(ui, &p, "Annuler", false).clicked() {
+                    app.send(Command::CancelAppLogin);
+                }
+            } else {
+                let ready = id_ok && secret_ok;
+                let response = ui.add_enabled_ui(ready, |ui| widgets::pill(ui, &p, "Connecter", true)).inner;
+                if response.clicked() && ready {
+                    if secret.is_empty() && keeps_secret {
+                        app.send(Command::ReconnectApp);
+                    } else {
+                        app.send(Command::SetupApp(AppCredentials { client_id: id, client_secret: secret }));
+                    }
+                }
+                if app.editing_app
+                    && status.state == AppState::Connected
+                    && widgets::pill(ui, &p, "Annuler", false).clicked()
+                {
+                    app.editing_app = false;
+                }
+            }
+        });
+    });
+}
+
+fn setup_footer(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    ui.label(
+        RichText::new(
+            "Le Client Secret reste sur cet ordinateur, chiffré par Windows pour votre session, et n'est envoyé qu'à Spotify.",
+        )
+        .small()
+        .color(p.faint),
+    );
+    ui.add_space(6.0);
+    if ui
+        .add(
+            egui::Label::new(RichText::new("Se déconnecter du compte Spotify").small().color(p.dim))
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+    {
+        app.send(Command::Logout);
+    }
+    ui.add_space(24.0);
+}
+
+/// One numbered step of the guide.
+fn step(ui: &mut Ui, p: &theme::Palette, number: u32, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+        ui.painter().circle_stroke(rect.center(), 11.0, Stroke::new(1.0, p.dim));
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            number.to_string(),
+            theme::strong_font(12.5),
+            p.text,
+        );
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.add_space(3.0);
+            add(ui);
+        });
+    });
+    ui.add_space(10.0);
+}
+
+/// "1a2b…9f0e": enough to recognise an id without displaying it in full.
+fn mask_id(id: &str) -> String {
+    if id.len() > 8 { format!("{}…{}", &id[..4], &id[id.len() - 4..]) } else { id.to_string() }
+}
+
+// ----------------------------------------------------------------------------
 // Toasts
 
 pub fn toasts(app: &App, ctx: &egui::Context) {
@@ -1125,7 +1368,7 @@ pub fn toasts(app: &App, ctx: &egui::Context) {
             for toast in &app.toasts {
                 Frame::new()
                     .fill(p.raised)
-                    .stroke(Stroke::new(1.0, if toast.error { p.danger } else { p.line }))
+                    .stroke(if toast.error { Stroke::new(1.5, p.danger) } else { Stroke::new(1.0, p.line) })
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(12, 8))
                     .show(ui, |ui| {
