@@ -1084,12 +1084,12 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
             );
             ui.add_space(4.0);
             changed |= ui
-                .radio_value(&mut app.settings.engine, Engine::Official, "Officiel Spotify (WebView2 + PlayReady)")
+                .radio_value(&mut app.settings.engine, Engine::Official, "Officiel Spotify (WebView2)")
                 .changed();
             ui.label(
                 RichText::new(
-                    "Le lecteur de Spotify lui-même, invisible, déchiffré par le DRM de Windows : lit les titres \
-                     refusés à librespot. Coûte ≈ 100 à 150 Mo de RAM en plus (processus Microsoft Edge WebView2), \
+                    "Le lecteur de Spotify lui-même, invisible, déchiffré par le DRM d'Edge (Widevine ou PlayReady), \
+                     comme dans un navigateur : lit les titres refusés à librespot. Coûte ≈ 100 à 150 Mo de RAM en plus (processus Microsoft Edge WebView2), \
                      sans choix de qualité ni cache audio. Interface, file d'attente et raccourcis restent ceux de SpotiLite.",
                 )
                 .small()

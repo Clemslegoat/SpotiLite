@@ -50,7 +50,7 @@ pub enum Engine {
     /// librespot inside SpotiLite: lightest, bitrate choice, audio cache.
     #[default]
     Native,
-    /// Spotify's own Web Playback SDK in an invisible WebView2 (PlayReady DRM):
+    /// Spotify's own Web Playback SDK in an invisible WebView2 (Widevine or PlayReady DRM):
     /// plays the tracks whose keys Spotify refuses to librespot, uses more memory.
     Official,
 }

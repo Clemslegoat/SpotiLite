@@ -20,7 +20,7 @@ Spotify refuse ses clés à librespot.
 | **Économe en données** | Qualité **Éco 96 kbit/s par défaut** (≈ 43 Mo/heure), cache audio sur disque (un titre réécouté ne coûte rien), réponses de l'API compressées (gzip), bibliothèque mise en cache et resynchronisée seulement quand elle change, pochettes minuscules (64 px) et désactivables. |
 | **Sobre** | Thème **noir AMOLED** (pixels éteints sur les écrans OLED) avec le **blanc comme seul accent** : listes typographiques, gris neutres, aucune image décorative, barre de titre Windows sombre. |
 | **Votre propre quota** | Bibliothèque et recherche passent par **votre application Spotify** (créée en 2 minutes sur le tableau de bord développeur, guide intégré) : fini les erreurs « limite de requêtes » du jeton partagé. |
-| **Deux moteurs de lecture** | **SpotiLite** (librespot, le plus léger) ou **Officiel Spotify** : le lecteur de Spotify lui-même, invisible, déchiffré par PlayReady, le DRM de Windows. Il lit les titres que Spotify refuse à librespot, contre plus de mémoire. |
+| **Deux moteurs de lecture** | **SpotiLite** (librespot, le plus léger) ou **Officiel Spotify** : le lecteur de Spotify lui-même, invisible, déchiffré par le DRM du moteur Edge (Widevine ou PlayReady), comme dans un navigateur. Il lit les titres que Spotify refuse à librespot, contre plus de mémoire. |
 | **Intégré à Windows** | Touches multimédia du clavier, panneau média de Windows (volume, écran de verrouillage), icône, pas de fenêtre console. |
 
 ## Fonctionnalités
@@ -109,17 +109,17 @@ l'URI de redirection ou d'oublier l'application.
 
 *Réglages → Lecture → Moteur de lecture* :
 
-| | SpotiLite (librespot) | Officiel Spotify (WebView2 + PlayReady) |
+| | SpotiLite (librespot) | Officiel Spotify (WebView2) |
 |---|---|---|
-| Mémoire | ≈ 50 Mo | ≈ 100 à 150 Mo **en plus** (processus Microsoft Edge WebView2) |
+| Mémoire | ≈ 50 Mo | ≈ 100 à 150 Mo **en plus** (processus Microsoft Edge WebView2 ; 134 Mo mesurés sous Windows) |
 | Qualité | 96, 160 ou 320 kbit/s, au choix | choisie par Spotify (AAC, en général 128 à 256 kbit/s) |
 | Cache audio | oui | non |
 | Titres refusés par Spotify (`0x0001`) | sautés | **lus** |
 
 Le moteur officiel est le [Web Playback SDK](https://developer.spotify.com/documentation/web-playback-sdk)
 de Spotify, chargé dans une page invisible de WebView2, le moteur Edge intégré à Windows 10 et
-11. Spotify y déchiffre l'audio avec **PlayReady**, le DRM de Windows, exactement comme dans un
-navigateur : SpotiLite ne contourne aucune protection, il pilote ce lecteur (lecture, pause,
+11. Spotify y déchiffre l'audio avec le **DRM du moteur Edge** (Widevine, ou PlayReady, le DRM de
+Windows), exactement comme dans un navigateur : SpotiLite ne contourne aucune protection, il pilote ce lecteur (lecture, pause,
 position, volume) et garde son interface, sa file d'attente et ses raccourcis. Le titre à lire est
 envoyé par l'API Web de votre application (`PUT /me/player/play`, une requête par titre).
 
@@ -178,7 +178,7 @@ première lecture et s'arrête quand vous revenez au moteur SpotiLite. Pour le d
   le titre est réessayé en 160 puis 320 kbit/s (la qualité qui fonctionne est gardée) ; un titre
   refusé dans toutes les qualités est sauté, grisé et non retenté pendant 14 jours (*Réglages →
   Lecture → Réessayer ces titres*). Si 10 titres d'affilée sont refusés, la lecture s'arrête.
-  **Solution : le moteur officiel** (ci-dessus), qui passe par PlayReady et n'est pas concerné.
+  **Solution : le moteur officiel** (ci-dessus), qui passe par le DRM d'Edge et n'est pas concerné.
 - **Refus temporaires (`0x0002`) ou absence de réponse** : SpotiLite embarque le correctif
   proposé en amont ([librespot#1763](https://github.com/librespot-org/librespot/pull/1763)) et
   redemande la clé jusqu'à 3 fois, puis se reconnecte une fois avant d'abandonner.
@@ -213,7 +213,7 @@ src/
 ├── backend/         thread réseau/audio (Tokio, 2 threads)
 │   ├── mod.rs       session librespot, lecteur, commandes, cache de bibliothèque
 │   ├── auth.rs      OAuth 2.0 dans le navigateur (Client Secret ou PKCE)
-│   ├── official/    moteur officiel : WebView2 invisible + Web Playback SDK (PlayReady)
+│   ├── official/    moteur officiel : WebView2 invisible + Web Playback SDK
 │   ├── webapi.rs    client minimal de l'API Web (gzip, pagination, reprise sur 429)
 │   ├── vault.rs     secrets chiffrés avec DPAPI sous Windows
 │   └── store.rs     cache disque (JSON et vignettes)

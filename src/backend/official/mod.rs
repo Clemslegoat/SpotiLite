@@ -2,8 +2,8 @@
 //! hosted in an invisible WebView2, the Edge engine built into Windows.
 //!
 //! Spotify refuses some audio keys to librespot; its own player never goes through
-//! that path: audio is decrypted by PlayReady, the DRM of Windows, exactly as in a
-//! browser. SpotiLite only drives it (play, pause, seek, volume) and keeps its own
+//! that path: audio is decrypted by the DRM of the Edge engine (Widevine, or
+//! PlayReady, the DRM of Windows), exactly as in a browser. SpotiLite only drives it (play, pause, seek, volume) and keeps its own
 //! interface and queue. It costs more memory than librespot (the WebView2
 //! processes), which is why it is optional.
 
@@ -76,6 +76,9 @@ pub enum ErrorKind {
     Autoplay,
     /// The SDK script could not be downloaded.
     Load,
+    /// The SDK refused to connect (token rejected: scope, Premium, or "Web
+    /// Playback SDK" not enabled for the application).
+    Connect,
     Other,
 }
 
@@ -88,6 +91,7 @@ impl ErrorKind {
             "playback_error" => Self::Playback,
             "autoplay_failed" => Self::Autoplay,
             "load" => Self::Load,
+            "connect" => Self::Connect,
             _ => Self::Other,
         }
     }
@@ -385,6 +389,11 @@ mod tests {
         assert_eq!(
             parse_message(r#"{"type":"drm","systems":["com.microsoft.playready.recommendation"]}"#),
             Some(EngineEvent::Drm(vec!["com.microsoft.playready.recommendation".into()]))
+        );
+        // What the SDK does with a rejected token (seen on a real WebView2).
+        assert_eq!(
+            parse_message(r#"{"type":"error","kind":"connect","message":"connexion du lecteur refusée"}"#),
+            Some(EngineEvent::Error(ErrorKind::Connect, "connexion du lecteur refusée".into()))
         );
         assert_eq!(parse_message(r#"{"type":"unknown"}"#), None);
         assert_eq!(parse_message("not json"), None);

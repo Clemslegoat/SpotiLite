@@ -262,7 +262,7 @@ impl App {
         );
         if std::env::var_os("SPOTILITE_DEMO_OFFICIAL").is_some() {
             self.settings.engine = crate::config::Engine::Official;
-            self.engine_status = "Prêt · DRM PlayReady".into();
+            self.engine_status = "Prêt · DRM Widevine".into();
             self.engine_memory = 118 * 1024 * 1024;
         }
         if let Ok(view) = std::env::var("SPOTILITE_DEMO_VIEW") {

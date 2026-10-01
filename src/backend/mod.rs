@@ -1619,7 +1619,7 @@ impl Core {
                 };
                 if systems.is_empty() {
                     self.ui.error(
-                        "WebView2 ne propose aucun DRM (PlayReady) sur ce PC : le lecteur officiel risque de ne rien lire. \
+                        "WebView2 ne propose aucun DRM (Widevine, PlayReady) sur ce PC : le lecteur officiel risque de ne rien lire. \
                          Mettez Windows et Microsoft Edge WebView2 à jour.",
                     );
                 }
@@ -1680,6 +1680,16 @@ impl Core {
             }
             ErrorKind::Load => {
                 self.ui.error("Lecteur officiel injoignable (sdk.scdn.co) : vérifiez la connexion Internet.");
+                true
+            }
+            ErrorKind::Connect => {
+                // Usually a token without the playback scopes: checked (and asked for)
+                // right away; otherwise the application or the account is the cause.
+                self.check_playback_scopes(true);
+                self.ui.error(
+                    "Spotify refuse de connecter le lecteur officiel. Vérifiez que « Web Playback SDK » est coché \
+                     dans votre application (tableau de bord Spotify → Settings → Edit) et que le compte est Premium.",
+                );
                 true
             }
             ErrorKind::Autoplay => {
