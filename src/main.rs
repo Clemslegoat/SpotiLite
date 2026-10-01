@@ -11,44 +11,29 @@ mod model;
 mod queue;
 mod sys;
 mod ui;
+mod window;
 
-use std::sync::Arc;
-
-use eframe::egui;
-
-fn main() -> eframe::Result {
+fn main() {
     let paths = config::Paths::detect();
     logger::init(&paths.log_file());
     log::info!("SpotiLite {} starting", env!("CARGO_PKG_VERSION"));
     let settings = config::Settings::load(&paths);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("SpotiLite")
-            .with_app_id("spotilite")
-            .with_inner_size(settings.window_size)
-            .with_min_inner_size([560.0, 380.0])
-            .with_icon(Arc::new(window_icon())),
-        renderer: eframe::Renderer::Glow,
-        // No MSAA, depth or stencil buffers: egui antialiases in its tessellator,
-        // and every extra buffer costs video memory.
-        multisampling: 0,
-        depth_buffer: 0,
-        stencil_buffer: 0,
-        dithering: false,
-        persist_window: false,
-        ..Default::default()
+    let options = window::Options {
+        title: "SpotiLite",
+        inner_size: settings.window_size,
+        min_size: [600.0, 420.0],
+        icon: window_icon(),
     };
-    eframe::run_native(
-        "SpotiLite",
-        options,
-        Box::new(move |cc| {
-            let app = ui::App::new(cc, paths, settings);
-            #[cfg(debug_assertions)]
-            let app = app.with_demo();
-            Ok(Box::new(app))
-        }),
-    )
+    let result = window::run(options, move |ctx, window| {
+        let app = ui::App::new(ctx, window, paths, settings);
+        #[cfg(debug_assertions)]
+        let app = app.with_demo();
+        app
+    });
+    if let Err(e) = result {
+        log::error!("{e}");
+    }
 }
 
 /// The icon is drawn in code (three white level-meter bars on a black tile with a

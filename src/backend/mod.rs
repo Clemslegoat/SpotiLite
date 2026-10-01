@@ -1,11 +1,12 @@
-//! Backend thread: Spotify session, audio player, Web API and caches.
+//! Backend thread: Web API, playback engine and caches.
 //!
-//! The UI sends [`Command`]s and receives [`Event`]s. Everything network or audio
-//! related runs here, on a small Tokio runtime (2 worker threads), so the interface
-//! never blocks.
+//! The UI sends [`Command`]s and receives [`Event`]s. Everything network related
+//! runs here, on a single-threaded Tokio runtime, so the interface never blocks.
+//! Sound comes from the playback engine (Spotify's own player in an invisible
+//! WebView2, see [`engine`]), started on demand and stopped when idle.
 
 mod auth;
-mod official;
+mod engine;
 mod store;
 mod vault;
 mod webapi;
@@ -15,35 +16,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
-use futures_util::StreamExt;
-use librespot_core::authentication::{AuthenticationError, Credentials};
-use librespot_core::cache::Cache;
-use librespot_core::config::SessionConfig;
-use librespot_core::session::Session;
-use librespot_core::{SpotifyId, SpotifyUri};
-use librespot_playback::audio_backend;
-use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
-use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig};
-use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::config::{Engine, Paths, Quality, Settings};
-use crate::model::{AlbumSummary, ArtistRef, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
+use crate::config::{Paths, Settings};
+use crate::model::{AlbumSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
 use crate::queue::Queue;
 pub use auth::AppCredentials;
 use auth::{AuthFlow, OAuthToken};
-use official::{EngineCommand, EngineEvent, ErrorKind, PlayerState, Progress, Tracker};
+use engine::{EngineCommand, EngineEvent, ErrorKind, PlayerState, Profile, Progress, Tracker};
 use store::Store;
-use webapi::{ApiError, WebApi};
+use webapi::{ApiError, Offset, PlayRequest, WebApi};
 
 /// Requests from the interface.
 pub enum Command {
-    Login,
-    CancelLogin,
-    Logout,
     /// Saves the user's Spotify application and authorizes it in the browser.
     SetupApp(AppCredentials),
     /// Authorizes the saved application again.
@@ -51,6 +37,8 @@ pub enum Command {
     CancelAppLogin,
     /// Disconnects the application and deletes its saved credentials.
     ForgetApp,
+    /// Forgets the authorization and the cached library (the application stays saved).
+    Logout,
     LoadPlaylists,
     Open {
         view: ViewKey,
@@ -59,6 +47,14 @@ pub enum Command {
     Play {
         tracks: Arc<Vec<Track>>,
         index: usize,
+    },
+    /// Lets Spotify play a whole playlist or artist (`spotify:playlist:…`).
+    PlayContext {
+        uri: String,
+        title: String,
+        shuffle: bool,
+        /// Number of tracks, when known (random start for shuffle).
+        total: u32,
     },
     PlayPause,
     Next,
@@ -76,12 +72,10 @@ pub enum Command {
     FetchImage(String),
     ApplySettings(Box<Settings>),
     ClearCache,
-    /// Gives the tracks Spotify refused another chance.
-    ClearRefused,
     Shutdown,
 }
 
-/// State of the user's own Spotify application, which serves the whole library.
+/// State of the user's own Spotify application, which serves the library and playback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppState {
     /// Unknown until the backend has read the saved credentials.
@@ -98,7 +92,7 @@ pub struct AppStatus {
     pub state: AppState,
     pub client_id: String,
     pub has_secret: bool,
-    /// The authorization predates the official engine: it lacks the playback scopes.
+    /// The authorization predates playback: it lacks the playback scopes.
     pub needs_playback_auth: bool,
 }
 
@@ -106,22 +100,12 @@ pub struct AppStatus {
 pub enum Event {
     Info(String),
     Error(String),
-    /// A message that replaces the previous one with the same key (counters).
+    /// A message that replaces the previous one with the same key.
     Notice {
         key: &'static str,
         text: String,
         error: bool,
     },
-    /// Tracks Spotify refuses to third-party clients (shown greyed out).
-    Refused(HashSet<String>),
-    TrackRefused(String),
-    NeedLogin,
-    LoginPending {
-        url: String,
-    },
-    Connecting,
-    /// Saved credentials exist but Spotify is unreachable: the cached library stays usable.
-    Offline,
     LoggedIn {
         user: String,
     },
@@ -133,6 +117,15 @@ pub enum Event {
         title: String,
         subtitle: String,
         tracks: Arc<Vec<Track>>,
+    },
+    /// A playlist whose tracks Spotify does not give to development mode
+    /// applications: it can only be played as a whole, by Spotify.
+    PlaylistContext {
+        view: ViewKey,
+        title: String,
+        subtitle: String,
+        uri: String,
+        total: u32,
     },
     Albums {
         view: ViewKey,
@@ -160,6 +153,8 @@ pub enum Event {
         upcoming: Vec<Track>,
         shuffle: bool,
         repeat: Repeat,
+        /// Name of the playlist or artist when Spotify chooses the tracks itself.
+        context: Option<String>,
     },
     Liked {
         track_id: String,
@@ -173,9 +168,9 @@ pub enum Event {
         api_bytes: u64,
         audio_bytes: u64,
     },
-    /// What the official engine is doing, for the settings page.
+    /// What the playback engine is doing, for the settings page.
     EngineStatus(String),
-    /// Memory of the official engine's WebView2 processes (0 when stopped).
+    /// Memory of the engine's WebView2 processes (0 when stopped).
     EngineMemory(u64),
 }
 
@@ -211,9 +206,9 @@ impl Backend {
         let thread = std::thread::Builder::new()
             .name("spotilite-core".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .max_blocking_threads(4)
+                // One thread is plenty for a few HTTP requests at a time.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .max_blocking_threads(2)
                     .thread_name("spotilite-io")
                     .enable_all()
                     .build()
@@ -242,31 +237,20 @@ impl Backend {
 }
 
 enum Internal {
-    StreamingToken(Result<String, String>),
-    Connected(Result<Session, (String, bool)>),
     AppToken(Result<(AppCredentials, OAuthToken), String>),
     LikedIds(HashSet<String>),
     Playlists(Vec<PlaylistSummary>),
     SearchDone(SearchResults),
-    /// Delayed move to the next track after an unavailable one (carries the load
+    /// Delayed move to the next track after an unplayable one (carries the load
     /// generation so that any newer user action cancels it).
-    SkipAfterUnavailable(u64),
-    /// Event of the official engine instance `.0`.
-    Official(u64, EngineEvent),
-    /// Starting a track on the official engine failed (load generation, error).
-    OfficialPlayFailed(u64, ApiError),
-    /// Playback scopes missing from the authorization (`.1`: the user just chose
-    /// the official engine, so the browser may be opened).
-    OfficialScopes(Vec<&'static str>, bool),
-    OfficialTokenFailed(String),
-}
-
-struct Audio {
-    player: Arc<Player>,
-    mixer: SoftMixer,
-    events: PlayerEventChannel,
-    quality: Quality,
-    normalisation: bool,
+    SkipAfterFailure(u64),
+    /// Event of the engine instance `.0`.
+    Engine(u64, EngineEvent),
+    /// Starting playback failed (load generation, error).
+    PlayFailed(u64, ApiError),
+    /// Playback scopes missing from the authorization (`.1`: the browser may be opened).
+    Scopes(Vec<&'static str>, bool),
+    TokenFailed(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -290,31 +274,22 @@ struct CachedArtist {
     albums: Vec<AlbumSummary>,
 }
 
-fn bitrate(quality: Quality) -> Bitrate {
-    match quality {
-        Quality::Eco => Bitrate::Bitrate96,
-        Quality::Normal => Bitrate::Bitrate160,
-        Quality::High => Bitrate::Bitrate320,
-    }
-}
-
-/// Next quality to try when Spotify refuses the key of a track's file.
-fn next_quality(quality: Quality) -> Option<Quality> {
-    match quality {
-        Quality::Eco => Some(Quality::Normal),
-        Quality::Normal => Some(Quality::High),
-        Quality::High => None,
-    }
-}
-
-/// Consecutive refused tracks before concluding the whole account is refused.
-const MAX_REFUSED_IN_A_ROW: u32 = 10;
-/// Bitrate assumed for the official engine when its traffic cannot be measured.
-const OFFICIAL_KBPS: u64 = 128;
-const REFUSED_TTL_SECS: u64 = 14 * 24 * 3600;
+/// Bitrate assumed when the engine's traffic cannot be measured.
+const ESTIMATED_KBPS: u64 = 128;
+/// Present when the lean engine profile could not play on this PC.
+const COMPATIBLE_MARKER: &str = "engine-compatible";
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A whole playlist or artist played by Spotify itself.
+struct Remote {
+    uri: String,
+    title: String,
+    current: Option<Track>,
+    upcoming: Vec<Track>,
+    started: bool,
 }
 
 struct Core {
@@ -324,63 +299,49 @@ struct Core {
     settings: Settings,
     http: reqwest::Client,
     store: Store,
-    cache: Option<Cache>,
     api_bytes: Arc<AtomicU64>,
-    session: Option<Session>,
     api: Arc<WebApi>,
-    /// The user's Spotify application is authorized: library calls can be made.
+    /// The user's Spotify application is authorized.
     app_connected: bool,
     app_login: Option<Arc<AtomicBool>>,
-    audio: Option<Audio>,
     queue: Queue,
+    /// Set while Spotify chooses the tracks (playlist of another user, artist).
+    remote: Option<Remote>,
     playing: bool,
     position_ms: u32,
     position_at: Instant,
-    /// Loads sent to the player whose play request id has not been announced yet:
-    /// until then, events still refer to a previous track and are ignored.
-    pending_loads: u32,
-    /// Whether the player currently holds the current track (false once stopped).
+    /// A play request was sent for the current track.
     loaded: bool,
-    unavailable_streak: u32,
-    /// Incremented by every load: identifies the attempt a delayed skip belongs to.
+    failure_streak: u32,
+    /// Incremented by every load: identifies the attempt a delayed action belongs to.
     load_generation: u64,
     load_started: Instant,
-    /// A fresh connection was already tried during the current failure streak.
-    reconnect_tried: bool,
-    /// Tracks whose audio key Spotify refused (id → when), kept 14 days.
-    refused: HashMap<String, u64>,
-    skipped_refused: u32,
-    /// Quality the player currently uses: the chosen one, or a higher one when
-    /// Spotify refused the key of the lower quality file.
-    quality: Quality,
-    /// Quality at which the current track was first attempted.
-    attempt_quality: Option<Quality>,
     listened_ms: u64,
-    audio_bytes: u64,
     last_usage: (u64, u64),
-    login_cancel: Option<Arc<AtomicBool>>,
-    connecting: bool,
-    retry_at: Option<Instant>,
-    pending_play: bool,
     playlists: HashMap<String, PlaylistSummary>,
     liked_ids: Option<HashSet<String>>,
     refreshed: HashMap<ViewKey, Instant>,
     searches: VecDeque<SearchResults>,
-    audio_failed: bool,
-    /// Spotify's own player in WebView2, started on demand ("moteur officiel").
-    official: Option<official::Engine>,
+    /// Spotify's player in WebView2, started on demand.
+    engine: Option<engine::Engine>,
     /// Instance number, so that events of a stopped engine are ignored.
-    official_id: u64,
-    /// Spotify device id of the official engine, once registered.
+    engine_id: u64,
+    /// Spotify device id of the engine, once registered.
     device_id: Option<String>,
-    /// Track waiting for the official engine to be ready (load generation, id, position).
-    official_pending: Option<(u64, String, u32)>,
+    /// Playback waiting for the engine to be ready (load generation, request).
+    pending: Option<(u64, PlayRequest)>,
     tracker: Tracker,
-    official_bytes: u64,
-    official_listened_ms: u64,
-    /// Load generation for which a stalled start was already reported.
-    official_stalled: u64,
-    /// The authorization lacks the scopes of the official engine.
+    engine_bytes: u64,
+    /// Something played on the current engine instance.
+    engine_played: bool,
+    /// Repeat already switched off on the device (one track at a time).
+    device_prepared: bool,
+    /// The lean profile failed on this PC: WebView2 defaults are used.
+    compatible: bool,
+    /// Load generation for which a stalled start was already handled.
+    stalled: u64,
+    last_active: Instant,
+    /// The authorization lacks the playback scopes.
     needs_playback_auth: bool,
     /// The browser was already opened once for those scopes in this session.
     playback_auth_asked: bool,
@@ -393,7 +354,8 @@ impl Core {
             .user_agent(concat!("SpotiLite/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(60))
             .build()
             .expect("http client");
         let store = Store::new(paths.data_cache(), paths.image_cache());
@@ -402,52 +364,42 @@ impl Core {
         let mut queue = Queue::default();
         queue.set_shuffle(settings.shuffle);
         queue.set_repeat(settings.repeat);
+        let compatible = paths.cache.join(COMPATIBLE_MARKER).exists();
         Self {
             ui,
             internal,
             http,
             store,
-            cache: None,
             api_bytes,
-            session: None,
             api,
             app_connected: false,
             app_login: None,
-            audio: None,
             queue,
+            remote: None,
             playing: false,
             position_ms: 0,
             position_at: Instant::now(),
-            pending_loads: 0,
             loaded: false,
-            unavailable_streak: 0,
+            failure_streak: 0,
             load_generation: 0,
             load_started: Instant::now(),
-            reconnect_tried: false,
-            refused: HashMap::new(),
-            skipped_refused: 0,
-            quality: settings.quality,
-            attempt_quality: None,
             listened_ms: 0,
-            audio_bytes: 0,
             last_usage: (u64::MAX, u64::MAX),
-            login_cancel: None,
-            connecting: false,
-            retry_at: None,
-            pending_play: false,
             playlists: HashMap::new(),
             liked_ids: None,
             refreshed: HashMap::new(),
             searches: VecDeque::new(),
-            audio_failed: false,
-            official: None,
-            official_id: 0,
+            engine: None,
+            engine_id: 0,
             device_id: None,
-            official_pending: None,
+            pending: None,
             tracker: Tracker::default(),
-            official_bytes: 0,
-            official_listened_ms: 0,
-            official_stalled: 0,
+            engine_bytes: 0,
+            engine_played: false,
+            device_prepared: false,
+            compatible,
+            stalled: 0,
+            last_active: Instant::now(),
             needs_playback_auth: false,
             playback_auth_asked: false,
             drm: String::new(),
@@ -471,27 +423,32 @@ impl Core {
                     Some(cmd) => self.handle(cmd).await,
                 },
                 Some(msg) = internal.recv() => self.handle_internal(msg).await,
-                Some(event) = next_player_event(&mut self.audio) => self.handle_player(event),
                 _ = tick.tick() => self.tick(),
             }
         }
-        self.shutdown();
+        for cancel in self.app_login.iter() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.engine = None;
     }
 
     async fn startup(&mut self) {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.prune());
+        let legacy = [self.paths.legacy_audio_cache(), self.paths.legacy_tmp()];
+        let credentials = self.paths.config.join("credentials.json");
+        tokio::task::spawn_blocking(move || {
+            store.prune();
+            // Leftovers of version 0.1 (librespot): audio cache (up to 4 GB) and session.
+            for dir in legacy {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            let _ = std::fs::remove_file(credentials);
+        });
         if let Some(list) = self.store.load::<Vec<PlaylistSummary>>("playlists") {
             self.remember_playlists(&list);
             self.ui.send(Event::Playlists(list));
         }
         self.send_queue();
-        // Tracks refused recently are not retried (the decision may change, hence
-        // the expiry).
-        let now = now_secs();
-        self.refused = self.store.load::<HashMap<String, u64>>("refused").unwrap_or_default();
-        self.refused.retain(|_, at| now.saturating_sub(*at) < REFUSED_TTL_SECS);
-        self.sync_blocked();
         // Version 0.1 kept the client id in the settings: move it to the vault.
         if self.api.saved_app().is_none() && !self.settings.legacy_client_id.is_empty() {
             self.api.save_app(&AppCredentials {
@@ -499,145 +456,30 @@ impl Core {
                 client_secret: String::new(),
             });
         }
-        // The library only needs the user's application, not the audio session:
-        // it can load while the audio connection is still being established.
         self.app_connected = self.api.restore().await;
         self.send_app_status();
         if self.app_connected {
-            self.load_playlists();
-            if self.official_mode() {
-                self.check_playback_scopes(false);
+            if let Some(name) = self.store.load::<String>("me") {
+                self.ui.send(Event::LoggedIn { user: name });
             }
-        }
-        match self.librespot_cache().and_then(|c| c.credentials()) {
-            Some(credentials) => self.connect(credentials, false),
-            None => self.ui.send(Event::NeedLogin),
+            self.after_connect();
         }
     }
 
-    fn shutdown(&mut self) {
-        for cancel in [&self.login_cancel, &self.app_login].into_iter().flatten() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        self.official = None;
-        if let Some(audio) = self.audio.take() {
-            audio.player.stop();
-            drop(audio);
-        }
-        if let Some(session) = self.session.take() {
-            session.shutdown();
-        }
-    }
-
-    fn librespot_cache(&mut self) -> Option<Cache> {
-        if self.cache.is_none() {
-            let mb = self.settings.audio_cache_mb;
-            let audio_dir = (mb > 0).then(|| self.paths.audio_cache());
-            match Cache::new(
-                Some(self.paths.config.clone()),
-                None,
-                audio_dir,
-                (mb > 0).then_some(mb * 1024 * 1024),
-            ) {
-                Ok(cache) => self.cache = Some(cache),
-                Err(e) => log::warn!("librespot cache unavailable: {e}"),
-            }
-        }
-        self.cache.clone()
-    }
-
-    // ----------------------------------------------------------------------
-    // Session
-
-    fn connect(&mut self, credentials: Credentials, store_credentials: bool) {
-        if self.connecting {
-            return;
-        }
-        self.connecting = true;
-        self.retry_at = None;
-        self.ui.send(Event::Connecting);
-        let _ = std::fs::create_dir_all(self.paths.tmp());
-        let config = SessionConfig { tmp_dir: self.paths.tmp(), ..SessionConfig::default() };
-        let session = Session::new(config, self.librespot_cache());
-        let internal = self.internal.clone();
-        tokio::spawn(async move {
-            let result = match tokio::time::timeout(
-                Duration::from_secs(30),
-                session.connect(credentials, store_credentials),
-            )
-            .await
-            {
-                Ok(Ok(())) => Ok(session),
-                Ok(Err(e)) => {
-                    let auth = e.error.downcast_ref::<AuthenticationError>().is_some();
-                    Err((e.to_string(), auth))
-                }
-                Err(_) => Err(("délai de connexion dépassé".to_string(), false)),
-            };
-            let _ = internal.send(Internal::Connected(result));
-        });
-    }
-
-    fn reconnect_if_needed(&mut self) -> bool {
-        let invalid = self.session.as_ref().is_none_or(Session::is_invalid);
-        if invalid
-            && !self.connecting
-            && let Some(credentials) = self.librespot_cache().and_then(|c| c.credentials())
-        {
-            log::info!("session lost, reconnecting");
-            self.connect(credentials, false);
-        }
-        invalid
-    }
-
-    async fn on_connected(&mut self, session: Session) {
-        self.connecting = false;
-        let user = session.username();
-        log::info!("connected as {user}");
-        match &self.audio {
-            Some(audio) if !audio.player.is_invalid() => audio.player.set_session(session.clone()),
-            _ => self.audio = None,
-        }
-        self.session = Some(session);
-
-        let display = self.store.load::<String>("me").unwrap_or(user);
-        self.ui.send(Event::LoggedIn { user: display });
+    /// Everything that needs the authorized application.
+    fn after_connect(&mut self) {
+        self.load_playlists();
         self.fetch_display_name();
         if let Some(liked) = self.store.load::<CachedTracks>("liked") {
             self.liked_ids = Some(liked.tracks.into_iter().map(|t| t.id).collect());
         }
-        if std::mem::take(&mut self.pending_play)
-            && let Some(track) = self.queue.current().cloned()
-        {
-            let position = self.position_ms;
-            self.load(track, true, position);
-        }
+        self.check_playback_scopes(false);
     }
 
-    fn start_login(&mut self) {
-        if let Some(cancel) = self.login_cancel.take() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        let desktop = AppCredentials {
-            client_id: auth::SPOTIFY_DESKTOP_CLIENT_ID.into(),
-            client_secret: String::new(),
-        };
-        let flow = match AuthFlow::start(desktop, 0, auth::STREAMING_SCOPES) {
-            Ok(flow) => flow,
-            Err(e) => return self.ui.error(format!("Connexion impossible : {e}")),
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.login_cancel = Some(cancel.clone());
-        self.ui.send(Event::LoginPending { url: flow.auth_url.clone() });
-        let _ = open::that_detached(&flow.auth_url);
-        let (http, internal) = (self.http.clone(), self.internal.clone());
-        tokio::spawn(async move {
-            let result = run_flow(flow, cancel, http).await.map(|t| t.access_token);
-            let _ = internal.send(Internal::StreamingToken(result));
-        });
-    }
+    // ----------------------------------------------------------------------
+    // The user's Spotify application
 
-    /// Opens the user's Spotify application authorization in the browser.
+    /// Opens the authorization of the user's Spotify application in the browser.
     fn start_app_login(&mut self, app: AppCredentials) {
         if let Some(cancel) = self.app_login.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -699,35 +541,70 @@ impl Core {
         });
     }
 
-    fn logout(&mut self) {
-        if let Some(audio) = self.audio.take() {
-            audio.player.stop();
-            tokio::task::spawn_blocking(move || drop(audio));
-        }
-        self.stop_official();
-        if let Some(session) = self.session.take() {
-            session.shutdown();
-        }
-        let _ = std::fs::remove_file(self.paths.config.join("credentials.json"));
+    async fn logout(&mut self) {
+        self.stop_engine();
         // The application credentials stay saved: logging in again only needs one click.
-        let api = self.api.clone();
-        tokio::spawn(async move { api.disconnect(false).await });
+        self.api.disconnect(false).await;
         self.app_connected = false;
+        self.needs_playback_auth = false;
         self.send_app_status();
         self.store.clear();
-        self.cache = None;
-        self.queue = Queue::default();
+        self.queue.clear();
+        self.remote = None;
         self.playlists.clear();
         self.liked_ids = None;
-        self.refused.clear();
-        self.queue.set_blocked(HashSet::new());
-        self.ui.send(Event::Refused(HashSet::new()));
         self.refreshed.clear();
         self.searches.clear();
         self.playing = false;
+        self.loaded = false;
         self.ui.send(Event::NowPlaying(None));
         self.ui.send(Event::Playlists(Vec::new()));
-        self.ui.send(Event::NeedLogin);
+        self.send_playback(false);
+        self.send_queue();
+    }
+
+    /// Checks that the authorization allows playback.
+    fn check_playback_scopes(&self, interactive: bool) {
+        if !self.app_connected {
+            return;
+        }
+        let (api, internal) = (self.api.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            if let Ok(missing) = api.missing_scopes(auth::PLAYBACK_SCOPES).await {
+                let _ = internal.send(Internal::Scopes(missing, interactive));
+            }
+        });
+    }
+
+    /// The authorization of the user's application predates playback: it must be
+    /// accepted again with the playback scopes.
+    fn ask_playback_auth(&mut self, open_browser: bool) {
+        self.needs_playback_auth = true;
+        let app = self.api.saved_app();
+        if open_browser
+            && !self.playback_auth_asked
+            && self.app_login.is_none()
+            && let Some(app) = app
+        {
+            self.playback_auth_asked = true;
+            self.ui.send(Event::Notice {
+                key: "auth",
+                text: "La lecture a besoin d'une autorisation de votre application Spotify : \
+                       acceptez-la dans le navigateur qui vient de s'ouvrir."
+                    .into(),
+                error: false,
+            });
+            return self.start_app_login(app);
+        }
+        self.send_app_status();
+        self.ui.send(Event::Notice {
+            key: "auth",
+            text: "Autorisez la lecture : Réglages → Application Spotify → « Autoriser la lecture ». \
+                   Si Spotify refuse encore, cochez « Web Playback SDK » dans les réglages de votre \
+                   application (tableau de bord Spotify → Settings → Edit)."
+                .into(),
+            error: true,
+        });
     }
 
     // ----------------------------------------------------------------------
@@ -735,19 +612,13 @@ impl Core {
 
     async fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Login => self.start_login(),
-            Command::CancelLogin => {
-                if let Some(cancel) = self.login_cancel.take() {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-            }
-            Command::Logout => self.logout(),
             Command::SetupApp(app) => {
                 let app = AppCredentials {
                     client_id: app.client_id.trim().to_string(),
                     client_secret: app.client_secret.trim().to_string(),
                 };
                 // A new application invalidates the previous authorization.
+                self.stop_engine();
                 self.api.disconnect(true).await;
                 self.app_connected = false;
                 self.api.save_app(&app);
@@ -772,16 +643,24 @@ impl Core {
                 if let Some(cancel) = self.app_login.take() {
                     cancel.store(true, Ordering::Relaxed);
                 }
+                self.stop_engine();
                 self.api.disconnect(true).await;
                 self.app_connected = false;
                 self.send_app_status();
             }
+            Command::Logout => self.logout().await,
             Command::LoadPlaylists => self.load_playlists(),
             Command::Open { view, force } => self.open(view, force),
             Command::Play { tracks, index } => {
+                self.remote = None;
                 if let Some(track) = self.queue.play_context(tracks, index) {
                     self.load(track, true, 0);
                 }
+            }
+            Command::PlayContext { uri, title, shuffle, total } => {
+                self.queue.set_shuffle(shuffle);
+                let offset = (shuffle && total > 1).then(|| Offset::Position(rand::random_range(0..total)));
+                self.play_remote(uri, title, offset, 0);
             }
             Command::PlayPause => self.play_pause(),
             Command::Next => self.skip(false),
@@ -789,25 +668,35 @@ impl Core {
             Command::Seek(ms) => self.seek_to(ms),
             Command::SetVolume(volume) => {
                 self.settings.volume = volume;
-                if let Some(audio) = &self.audio {
-                    audio.mixer.set_volume(volume_to_u16(volume));
-                }
-                if let Some(engine) = &self.official {
+                if let Some(engine) = &self.engine {
                     engine.send(EngineCommand::Volume(volume));
                 }
             }
             Command::SetShuffle(on) => {
                 self.queue.set_shuffle(on);
+                if self.remote.is_some() {
+                    self.device_call(move |api, device| async move { api.set_shuffle(&device, on).await });
+                }
                 self.send_queue();
             }
             Command::SetRepeat(mode) => {
                 self.queue.set_repeat(mode);
+                if self.remote.is_some() {
+                    self.device_call(move |api, device| async move {
+                        api.set_repeat(&device, repeat_state(mode)).await
+                    });
+                }
                 self.send_queue();
             }
             Command::Enqueue(track) => {
                 let name = track.name.clone();
-                self.queue.enqueue(track);
-                self.send_queue();
+                if self.remote.is_some() {
+                    let id = track.id.clone();
+                    self.device_call(move |api, device| async move { api.add_to_queue(&device, &id).await });
+                } else {
+                    self.queue.enqueue(track);
+                    self.send_queue();
+                }
                 self.ui.send(Event::Info(format!("« {name} » ajouté à la file")));
             }
             Command::ClearQueue => {
@@ -816,103 +705,70 @@ impl Core {
             }
             Command::SetLiked { track, liked } => self.set_liked(track, liked),
             Command::FetchImage(url) => self.fetch_image(url),
-            Command::ApplySettings(settings) => self.apply_settings(*settings).await,
+            Command::ApplySettings(settings) => self.apply_settings(*settings),
             Command::ClearCache => self.clear_cache(),
-            Command::ClearRefused => {
-                self.clear_refused();
-                self.ui.send(Event::Info("Les titres refusés seront retentés.".into()));
-            }
             Command::Shutdown => {}
         }
     }
 
     async fn handle_internal(&mut self, msg: Internal) {
         match msg {
-            Internal::StreamingToken(Ok(token)) => {
-                self.login_cancel = None;
-                self.connect(Credentials::with_access_token(token), true);
-            }
             // A cancelled flow was replaced or abandoned on purpose: its handle is
             // already gone and must not clear the one of a newer flow.
-            Internal::StreamingToken(Err(e)) if e.contains("annulée") => {}
-            Internal::StreamingToken(Err(e)) => {
-                self.login_cancel = None;
-                self.ui.error(format!("Connexion impossible : {e}"));
-                if self.session.is_none() {
-                    self.ui.send(Event::NeedLogin);
-                }
-            }
-            Internal::Connected(Ok(session)) => self.on_connected(session).await,
-            Internal::Connected(Err((message, auth))) => {
-                self.connecting = false;
-                log::warn!("connection failed: {message}");
-                if auth {
-                    let _ = std::fs::remove_file(self.paths.config.join("credentials.json"));
-                    self.cache = None;
-                    self.ui.error("Session expirée : reconnectez-vous.");
-                    self.ui.send(Event::NeedLogin);
-                } else {
-                    self.ui.error(format!(
-                        "Connexion à Spotify impossible ({message}). Nouvel essai dans 15 s."
-                    ));
-                    self.retry_at = Some(Instant::now() + Duration::from_secs(15));
-                    if self.session.is_none() {
-                        self.ui.send(Event::Offline);
-                    }
-                }
-            }
             Internal::AppToken(Err(e)) if e.contains("annulée") => {}
             Internal::AppToken(result) => {
                 self.app_login = None;
                 match result {
                     Ok((app, token)) => {
-                        let missing = token.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES);
-                        let resume = self.needs_playback_auth && missing.is_empty() && self.official_mode();
+                        let missing = token.missing_scopes(auth::PLAYBACK_SCOPES);
+                        let resume = self.needs_playback_auth && missing.is_empty();
+                        let first = !self.app_connected;
                         self.needs_playback_auth = !missing.is_empty();
                         self.api.connect(app, token).await;
                         self.app_connected = true;
                         self.refreshed.clear();
                         self.ui.send(Event::Info("Application Spotify connectée.".into()));
-                        self.load_playlists();
-                        self.fetch_display_name();
-                        if resume && let Some(track) = self.queue.current().cloned() {
+                        if first {
+                            self.after_connect();
+                        }
+                        if resume && !self.playing {
                             // The play that needed the new authorization.
-                            let position = self.position_ms;
-                            self.load(track, true, position);
+                            self.stop_engine();
+                            self.play_pause();
                         }
                     }
                     Err(e) => self.ui.error(app_error_hint(&e)),
                 }
                 self.send_app_status();
             }
-            Internal::SkipAfterUnavailable(generation) => {
+            Internal::SkipAfterFailure(generation) => {
                 if generation == self.load_generation {
                     self.skip(false);
                 }
             }
-            Internal::Official(id, event) => {
-                if id == self.official_id && self.official.is_some() {
-                    self.on_official(event);
+            Internal::Engine(id, event) => {
+                if id == self.engine_id && self.engine.is_some() {
+                    self.on_engine(event);
                 }
             }
-            Internal::OfficialPlayFailed(generation, error) => {
+            Internal::PlayFailed(generation, error) => {
                 if generation == self.load_generation {
-                    self.on_official_play_failed(error);
+                    self.on_play_failed(error);
                 }
             }
-            Internal::OfficialScopes(missing, interactive) => {
+            Internal::Scopes(missing, interactive) => {
                 if missing.is_empty() {
                     if self.needs_playback_auth {
                         self.needs_playback_auth = false;
                         self.send_app_status();
                     }
                 } else {
-                    log::info!("authorization lacks {missing:?} for the official engine");
+                    log::info!("authorization lacks {missing:?} for playback");
                     self.ask_playback_auth(interactive);
                 }
             }
-            Internal::OfficialTokenFailed(e) => {
-                self.ui.error(format!("Moteur officiel : jeton d'accès indisponible ({e})."));
+            Internal::TokenFailed(e) => {
+                self.ui.error(format!("Lecture : jeton d'accès indisponible ({e})."));
             }
             Internal::LikedIds(ids) => self.liked_ids = Some(ids),
             Internal::Playlists(list) => {
@@ -931,52 +787,43 @@ impl Core {
     }
 
     fn tick(&mut self) {
-        // The connection to Spotify dropped (sleep, network change…): reconnect quietly.
-        if self.session.as_ref().is_some_and(Session::is_invalid)
-            && !self.connecting
-            && self.retry_at.is_none()
-        {
-            self.reconnect_if_needed();
-        }
-        if self.retry_at.is_some_and(|t| Instant::now() >= t) {
-            self.retry_at = None;
-            if let Some(credentials) = self.librespot_cache().and_then(|c| c.credentials()) {
-                self.connect(credentials, false);
-            }
-        }
         if self.api.take_lost() {
             self.app_connected = false;
+            self.stop_engine();
             self.ui
                 .error("L'autorisation de votre application Spotify a expiré : cliquez sur « Reconnecter ».");
             self.send_app_status();
         }
-        if self.audio.as_ref().is_some_and(|a| a.player.is_invalid()) && !self.audio_failed {
-            self.audio_failed = true;
-            self.audio = None;
-            self.playing = false;
-            self.loaded = false;
-            self.ui.error(
-                "Sortie audio indisponible. Vérifiez votre périphérique audio puis relancez la lecture.",
-            );
-            self.send_playback(false);
+        if self.playing {
+            self.last_active = Instant::now();
         }
-        if self.official_mode() && self.official.is_some() {
-            if self.tracker.overdue(Instant::now()) {
-                log::info!("official engine: end of track not reported");
+        if self.engine.is_some() {
+            let now = Instant::now();
+            if self.remote.is_none() && self.tracker.overdue(now) {
+                log::info!("end of track not reported");
                 self.flush_listened();
                 self.playing = false;
                 self.skip(true);
             } else if self.loaded
-                && !self.tracker.started()
+                && !self.started()
                 && self.load_started.elapsed() > Duration::from_secs(25)
-                && self.official_stalled != self.load_generation
+                && self.stalled != self.load_generation
             {
-                self.official_stalled = self.load_generation;
+                self.stalled = self.load_generation;
+                if !self.compatible && !self.engine_played {
+                    return self.fall_back_to_compatible("rien ne démarre");
+                }
                 self.loaded = false;
-                self.ui.error(
-                    "Le moteur officiel ne démarre pas la lecture. Réessayez ; si cela persiste, \
-                     repassez au moteur SpotiLite (Réglages → Lecture).",
-                );
+                self.ui.error("Spotify ne démarre pas la lecture. Réessayez dans un instant.");
+                self.send_playback(false);
+            }
+            // Asleep after a long pause: its WebView2 processes give their memory back.
+            let idle = u64::from(self.settings.engine_idle_minutes) * 60;
+            if idle > 0 && !self.playing && self.last_active.elapsed() >= Duration::from_secs(idle) {
+                log::info!("engine idle: stopped");
+                self.loaded = false;
+                self.stop_engine();
+                self.ui.send(Event::EngineStatus("En veille : il redémarre à la prochaine lecture".into()));
                 self.send_playback(false);
             }
         }
@@ -985,14 +832,9 @@ impl Core {
 
     fn send_usage(&mut self) {
         let current = if self.playing { self.position_at.elapsed().as_millis() as u64 } else { 0 };
-        let (native_ms, official_ms) = if self.official_mode() {
-            (self.listened_ms, self.official_listened_ms + current)
-        } else {
-            (self.listened_ms + current, self.official_listened_ms)
-        };
         // What WebView2 reports, or an estimate if its audio requests are not seen.
-        let official = self.official_bytes.max(official_ms * OFFICIAL_KBPS / 8);
-        let audio = self.audio_bytes + native_ms * u64::from(self.quality.kbps()) / 8 + official;
+        let estimate = (self.listened_ms + current) * ESTIMATED_KBPS / 8;
+        let audio = self.engine_bytes.max(estimate);
         let api = self.api_bytes.load(Ordering::Relaxed);
         if (api, audio) != self.last_usage {
             self.last_usage = (api, audio);
@@ -1000,55 +842,17 @@ impl Core {
         }
     }
 
-    async fn apply_settings(&mut self, new: Settings) {
-        if new.quality != self.settings.quality {
-            // Refusals may depend on the file format: give every track a new chance.
-            self.clear_refused();
-        }
-        let engine_changed = new.engine != self.settings.engine;
-        let (position, playing) = (self.current_position(), self.playing);
-        if engine_changed {
-            // Counted for the engine that played it.
-            self.flush_listened();
-        }
+    fn apply_settings(&mut self, new: Settings) {
+        let covers_off = self.settings.show_covers && !new.show_covers;
         self.settings = new;
-        self.quality = self.settings.quality;
-        if engine_changed {
-            return self.switch_engine(position, playing);
-        }
-        let audio_changed = self
-            .audio
-            .as_ref()
-            .is_some_and(|a| a.quality != self.quality || a.normalisation != self.settings.normalisation);
-        if audio_changed {
-            // The bitrate is fixed when the player is created: rebuild it and resume.
-            self.flush_listened();
-            if let Some(audio) = self.audio.take() {
-                audio.player.stop();
-                tokio::task::spawn_blocking(move || drop(audio));
-            }
-            if let Some(track) = self.queue.current().cloned() {
-                let position = self.current_position();
-                let playing = self.playing;
-                self.load(track, playing, position);
-            }
-        }
-        if !self.settings.show_covers {
+        if covers_off {
             self.ui.send(Event::Info("Pochettes désactivées : plus aucune image téléchargée.".into()));
         }
     }
 
     fn clear_cache(&mut self) {
-        let before = self.store.size() + store::dir_size(&self.paths.audio_cache());
+        let before = self.store.size();
         self.store.clear();
-        let audio = self.paths.audio_cache();
-        if let Ok(entries) = std::fs::read_dir(&audio) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let _ =
-                    if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
-            }
-        }
         self.refreshed.clear();
         self.ui.send(Event::Info(format!("Cache vidé ({}).", human_bytes(before))));
     }
@@ -1056,108 +860,162 @@ impl Core {
     // ----------------------------------------------------------------------
     // Playback
 
-    fn ensure_audio(&mut self) -> Option<&Audio> {
-        if self.audio.as_ref().is_some_and(|a| a.player.is_invalid()) {
-            self.audio = None;
+    /// A track of SpotiLite's own queue (one track is sent at a time).
+    fn load(&mut self, track: Track, play: bool, position_ms: u32) {
+        self.begin_load();
+        self.position_ms = position_ms;
+        self.ui.send(Event::NowPlaying(Some(track.clone())));
+        self.send_queue();
+        self.refresh_liked_state(&track);
+        if !play || !self.ensure_engine() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Pause);
+            }
+            return self.send_playback(false);
         }
-        if self.audio.is_none() {
-            let session = self.session.clone()?;
-            let mixer = match SoftMixer::open(MixerConfig::default()) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.ui.error(format!("Mixeur audio indisponible : {e}"));
-                    return None;
-                }
-            };
-            mixer.set_volume(volume_to_u16(self.settings.volume));
-            let config = PlayerConfig {
-                bitrate: bitrate(self.quality),
-                normalisation: self.settings.normalisation,
-                gapless: true,
-                ..PlayerConfig::default()
-            };
-            let backend = audio_backend::find(None)?;
-            let player = Player::new(config, session, mixer.get_soft_volume(), move || {
-                backend(None, AudioFormat::default())
-            });
-            let events = player.get_player_event_channel();
-            self.audio_failed = false;
-            self.loaded = false;
-            self.pending_loads = 0;
-            self.audio = Some(Audio {
-                player,
-                mixer,
-                events,
-                quality: self.quality,
-                normalisation: self.settings.normalisation,
-            });
-        }
-        self.audio.as_ref()
+        self.tracker.expect(track.id.clone(), track.duration_ms);
+        self.loaded = true;
+        self.send_playback(true);
+        self.request_play(PlayRequest::Track { id: track.id, position_ms });
     }
 
-    fn load(&mut self, track: Track, play: bool, position_ms: u32) {
-        self.attempt_quality = None;
+    /// A whole playlist or artist, played by Spotify itself.
+    fn play_remote(&mut self, uri: String, title: String, offset: Option<Offset>, position_ms: u32) {
+        self.queue.clear();
+        self.begin_load();
+        self.position_ms = position_ms;
+        self.remote =
+            Some(Remote { uri: uri.clone(), title, current: None, upcoming: Vec::new(), started: false });
+        self.ui.send(Event::NowPlaying(None));
+        self.send_queue();
+        if !self.ensure_engine() {
+            return self.send_playback(false);
+        }
+        self.loaded = true;
+        self.send_playback(true);
+        self.request_play(PlayRequest::Context { uri, offset, position_ms });
+    }
+
+    fn begin_load(&mut self) {
         self.load_generation += 1;
         self.load_started = Instant::now();
         self.flush_listened();
-        self.ui.send(Event::NowPlaying(Some(track.clone())));
-        self.position_ms = position_ms;
         self.position_at = Instant::now();
         self.playing = false;
-        if self.official_mode() {
-            return self.load_official(track, play, position_ms);
-        }
-        if self.reconnect_if_needed() {
-            self.pending_play = play;
-            self.send_playback(true);
-            self.send_queue();
+        self.loaded = false;
+        self.tracker.clear();
+        self.pending = None;
+        self.last_active = Instant::now();
+    }
+
+    /// Asks Spotify to start playback on the engine (one Web API call).
+    fn request_play(&mut self, request: PlayRequest) {
+        let generation = self.load_generation;
+        let Some(device) = self.device_id.clone() else {
+            // Sent when the engine announces itself.
+            self.pending = Some((generation, request));
             return;
+        };
+        // Single tracks must not loop with the account's "repeat"; whole contexts
+        // follow SpotiLite's shuffle and repeat buttons.
+        let (shuffle, repeat) = (self.queue.shuffle(), self.queue.repeat());
+        let prepare = !self.device_prepared;
+        self.device_prepared = true;
+        let (api, internal) = (self.api.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            let context = matches!(request, PlayRequest::Context { .. });
+            let mut attempt = 0;
+            let result = loop {
+                match api.play_on_device(&device, &request).await {
+                    // Spotify's servers learn about a new device a moment after it is ready.
+                    Err(ApiError::NotFound) if attempt < 3 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                    }
+                    other => break other,
+                }
+            };
+            match result {
+                Ok(()) if context => {
+                    // Applied once the device is active (a random start is already chosen).
+                    let _ = api.set_shuffle(&device, shuffle).await;
+                    let _ = api.set_repeat(&device, repeat_state(repeat)).await;
+                }
+                Ok(()) if prepare => {
+                    let _ = api.set_repeat(&device, "off").await;
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = internal.send(Internal::PlayFailed(generation, e));
+                }
+            }
+        });
+    }
+
+    /// A player call on the engine's device (shuffle, repeat, queue).
+    fn device_call<F, Fut>(&self, call: F)
+    where
+        F: FnOnce(Arc<WebApi>, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), ApiError>> + Send,
+    {
+        let Some(device) = self.device_id.clone() else { return };
+        let (api, ui) = (self.api.clone(), self.ui.clone());
+        tokio::spawn(async move {
+            if let Err(e) = call(api, device).await {
+                ui.error(format!("Spotify : {e}"));
+            }
+        });
+    }
+
+    fn started(&self) -> bool {
+        match &self.remote {
+            Some(remote) => remote.started,
+            None => self.tracker.started(),
         }
-        let Ok(id) = SpotifyId::from_base62(&track.id) else {
-            return self.ui.error(format!("Identifiant de titre invalide : {}", track.id));
-        };
-        let Some(audio) = self.ensure_audio() else {
-            return self.ui.error("Lecteur audio indisponible.");
-        };
-        audio.player.load(SpotifyUri::Track { id }, play, position_ms);
-        self.pending_loads += 1;
-        self.loaded = true;
-        self.send_playback(play);
-        self.send_queue();
-        self.refresh_liked_state(&track);
     }
 
     fn play_pause(&mut self) {
-        let Some(track) = self.queue.current().cloned() else { return };
-        if self.official_mode() {
-            return self.official_play_pause(track);
-        }
         if self.playing {
-            if let Some(audio) = &self.audio {
-                audio.player.pause();
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Pause);
             }
-        } else if self.loaded
-            && self.pending_loads == 0
-            && self.audio.as_ref().is_some_and(|a| !a.player.is_invalid())
-            && self.session.as_ref().is_some_and(|s| !s.is_invalid())
-        {
-            if let Some(audio) = &self.audio {
-                audio.player.play();
+            let position = self.current_position();
+            self.flush_listened();
+            self.playing = false;
+            self.position_ms = position;
+            self.position_at = Instant::now();
+            self.tracker.paused(Instant::now());
+            return self.send_playback(false);
+        }
+        if self.loaded && self.started() && self.device_id.is_some() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Resume);
             }
-        } else {
-            let position = self.position_ms;
+            return;
+        }
+        // Nothing loaded (engine asleep, other device…): start again where we were.
+        let position = self.position_ms;
+        if let Some(remote) = &self.remote {
+            let (uri, title) = (remote.uri.clone(), remote.title.clone());
+            let offset = remote.current.as_ref().map(|t| Offset::Track(t.id.clone()));
+            let position = if offset.is_some() { position } else { 0 };
+            self.play_remote(uri, title, offset, position);
+        } else if let Some(track) = self.queue.current().cloned() {
             self.load(track, true, position);
         }
     }
 
     fn skip(&mut self, auto: bool) {
+        if self.remote.is_some() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Next);
+            }
+            return;
+        }
         match self.queue.advance(auto) {
             Some(track) => self.load(track, true, 0),
             None => {
-                if let Some(audio) = &self.audio {
-                    audio.player.stop();
-                }
-                if let Some(engine) = &self.official {
+                if let Some(engine) = &self.engine {
                     engine.send(EngineCommand::Pause);
                 }
                 self.tracker.clear();
@@ -1174,6 +1032,12 @@ impl Core {
         if self.current_position() > 3000 {
             return self.seek_to(0);
         }
+        if self.remote.is_some() {
+            if let Some(engine) = &self.engine {
+                engine.send(EngineCommand::Previous);
+            }
+            return;
+        }
         match self.queue.back() {
             Some(track) => self.load(track, true, 0),
             None => self.seek_to(0),
@@ -1181,15 +1045,11 @@ impl Core {
     }
 
     fn seek_to(&mut self, ms: u32) {
-        if self.official_mode() {
-            if self.loaded
-                && let Some(engine) = &self.official
-            {
-                engine.send(EngineCommand::Seek(ms));
-                self.tracker.seeked(ms, Instant::now());
-            }
-        } else if let Some(audio) = &self.audio {
-            audio.player.seek(ms);
+        if self.loaded
+            && let Some(engine) = &self.engine
+        {
+            engine.send(EngineCommand::Seek(ms));
+            self.tracker.seeked(ms, Instant::now());
         }
         self.set_position(ms);
     }
@@ -1211,12 +1071,7 @@ impl Core {
 
     fn flush_listened(&mut self) {
         if self.playing {
-            let elapsed = self.position_at.elapsed().as_millis() as u64;
-            if self.official_mode() {
-                self.official_listened_ms += elapsed;
-            } else {
-                self.listened_ms += elapsed;
-            }
+            self.listened_ms += self.position_at.elapsed().as_millis() as u64;
             self.position_at = Instant::now();
         }
     }
@@ -1226,342 +1081,100 @@ impl Core {
     }
 
     fn send_queue(&self) {
-        self.ui.send(Event::Queue {
-            upcoming: self.queue.upcoming(100),
-            shuffle: self.queue.shuffle(),
-            repeat: self.queue.repeat(),
-        });
-    }
-
-    /// A track could not be played: explain why, and avoid hammering Spotify.
-    fn on_unavailable(&mut self) {
-        self.playing = false;
-        self.loaded = false;
-        self.unavailable_streak += 1;
-        let current = self.queue.current().cloned();
-        let name = current.as_ref().map(|t| t.name.clone()).unwrap_or_default();
-        let messages = crate::logger::playback_messages_since(self.load_started);
-        let reason = PlaybackFailure::from_messages(&messages);
-        log::warn!("track unavailable ({reason:?}): {messages:?}");
-
-        if reason == PlaybackFailure::KeyDenied {
-            // Spotify may refuse the key of one file format and accept another:
-            // try the same track again at the next higher quality.
-            if let (Some(track), Some(next)) = (current.clone(), next_quality(self.quality)) {
-                let first = self.attempt_quality.unwrap_or(self.quality);
-                self.unavailable_streak -= 1;
-                self.ui.send(Event::Notice {
-                    key: "quality",
-                    text: format!(
-                        "Clé refusée en {} kbit/s : nouvel essai en {} kbit/s…",
-                        self.quality.kbps(),
-                        next.kbps()
-                    ),
-                    error: false,
-                });
-                self.quality = next;
-                if let Some(audio) = self.audio.take() {
-                    audio.player.stop();
-                    tokio::task::spawn_blocking(move || drop(audio));
-                }
-                self.load(track, true, 0);
-                self.attempt_quality = Some(first);
-                return;
-            }
-            // Refused in every quality. Remember the track so it is not retried
-            // (no wasted data) and keep going with the others, back at the
-            // quality the attempts started from.
-            if let Some(first) = self.attempt_quality.take()
-                && first != self.quality
-            {
-                self.quality = first;
-                if let Some(audio) = self.audio.take() {
-                    audio.player.stop();
-                    tokio::task::spawn_blocking(move || drop(audio));
-                }
-            }
-            if let Some(track) = &current {
-                self.remember_refused(track.id.clone());
-            }
-            self.skipped_refused += 1;
-            if self.unavailable_streak >= MAX_REFUSED_IN_A_ROW {
-                self.unavailable_streak = 0;
-                self.ui.send(Event::Notice {
-                    key: "refused",
-                    text: format!(
-                        "Lecture arrêtée : Spotify a refusé les {MAX_REFUSED_IN_A_ROW} derniers titres à librespot. \
-                         Le moteur officiel (Réglages → Lecture) les lit avec le DRM de Windows."
-                    ),
-                    error: true,
-                });
-                self.send_playback(false);
-                return;
-            }
-            let count = self.skipped_refused;
-            self.ui.send(Event::Notice {
-                key: "refused",
-                text: format!(
-                    "{count} titre{} ignoré{} : Spotify refuse {} clé de déchiffrement à librespot (code 0x0001). \
-                     Le moteur officiel (Réglages → Lecture) peut {} lire.",
-                    if count > 1 { "s" } else { "" },
-                    if count > 1 { "s" } else { "" },
-                    if count > 1 { "leur" } else { "sa" },
-                    if count > 1 { "les" } else { "le" },
-                ),
-                error: false,
-            });
-            self.send_playback(false);
-            self.schedule_skip(Duration::from_millis(700));
-            return;
-        }
-
-        if self.unavailable_streak >= 3 {
-            if matches!(reason, PlaybackFailure::KeyDeniedTemporarily | PlaybackFailure::KeyTimeout)
-                && !self.reconnect_tried
-            {
-                // Keys time out or are refused temporarily over this access point:
-                // try a fresh connection once before giving up.
-                self.reconnect_tried = true;
-                self.unavailable_streak = 0;
-                self.ui.error("Spotify ne délivre pas les clés audio : reconnexion puis nouvel essai…");
-                if let Some(session) = self.session.take() {
-                    session.shutdown();
-                }
-                if let Some(track) = current {
-                    self.load(track, true, 0);
-                }
-                return;
-            }
-            self.unavailable_streak = 0;
-            self.reconnect_tried = false;
-            self.ui.error(reason.stop_message());
-            self.send_playback(false);
-            return;
-        }
-        self.ui.error(format!("« {name} » : {} Titre suivant…", reason.short()));
-        self.send_playback(false);
-        // A pause before the next attempt: skipping at full speed only triggers
-        // Spotify's rate limits.
-        self.schedule_skip(Duration::from_millis(1500));
+        let event = match &self.remote {
+            Some(remote) => Event::Queue {
+                upcoming: remote.upcoming.clone(),
+                shuffle: self.queue.shuffle(),
+                repeat: self.queue.repeat(),
+                context: Some(remote.title.clone()),
+            },
+            None => Event::Queue {
+                upcoming: self.queue.upcoming(100),
+                shuffle: self.queue.shuffle(),
+                repeat: self.queue.repeat(),
+                context: None,
+            },
+        };
+        self.ui.send(event);
     }
 
     fn schedule_skip(&self, delay: Duration) {
         let (internal, generation) = (self.internal.clone(), self.load_generation);
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = internal.send(Internal::SkipAfterUnavailable(generation));
+            let _ = internal.send(Internal::SkipAfterFailure(generation));
         });
-    }
-
-    /// Forgets the refused tracks: they will be tried again.
-    fn clear_refused(&mut self) {
-        self.refused.clear();
-        self.store.save("refused", &self.refused);
-        self.queue.set_blocked(HashSet::new());
-        self.ui.send(Event::Refused(HashSet::new()));
-    }
-
-    fn remember_refused(&mut self, id: String) {
-        self.refused.insert(id.clone(), now_secs());
-        self.store.save("refused", &self.refused);
-        self.queue.block(id.clone());
-        self.ui.send(Event::TrackRefused(id));
     }
 
     // ----------------------------------------------------------------------
-    // Official engine (Spotify's Web Playback SDK in WebView2)
+    // Playback engine (Spotify's Web Playback SDK in WebView2)
 
-    fn official_mode(&self) -> bool {
-        self.settings.engine == Engine::Official
-    }
-
-    /// Refused tracks are only skipped (and greyed out) with librespot: the
-    /// official engine plays them.
-    fn sync_blocked(&mut self) {
-        let ids: HashSet<String> =
-            if self.official_mode() { HashSet::new() } else { self.refused.keys().cloned().collect() };
-        self.queue.set_blocked(ids.clone());
-        self.ui.send(Event::Refused(ids));
-    }
-
-    fn switch_engine(&mut self, position: u32, playing: bool) {
-        log::info!("playback engine: {:?}", self.settings.engine);
-        self.playing = false;
-        self.loaded = false;
-        self.sync_blocked();
-        if self.official_mode() {
-            if let Some(audio) = self.audio.take() {
-                audio.player.stop();
-                tokio::task::spawn_blocking(move || drop(audio));
-            }
-            self.check_playback_scopes(true);
-            // Started right away: it is ready by the time a track is chosen.
-            self.ensure_official();
-        } else {
-            self.stop_official();
-            self.ui.send(Event::EngineStatus("Arrêté".into()));
-        }
-        match self.queue.current().cloned() {
-            Some(track) => self.load(track, playing, position),
-            None => self.send_playback(false),
-        }
-    }
-
-    /// Checks that the authorization allows the official engine to play.
-    fn check_playback_scopes(&self, interactive: bool) {
-        if !self.app_connected {
-            return;
-        }
-        let (api, internal) = (self.api.clone(), self.internal.clone());
-        tokio::spawn(async move {
-            if let Ok(missing) = api.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES).await {
-                let _ = internal.send(Internal::OfficialScopes(missing, interactive));
-            }
-        });
-    }
-
-    /// The authorization of the user's application predates the official engine:
-    /// it must be accepted again with the playback scopes.
-    fn ask_playback_auth(&mut self, open_browser: bool) {
-        self.needs_playback_auth = true;
-        let app = self.api.saved_app();
-        if open_browser
-            && !self.playback_auth_asked
-            && self.app_login.is_none()
-            && let Some(app) = app
-        {
-            self.playback_auth_asked = true;
-            self.ui.send(Event::Notice {
-                key: "engine",
-                text:
-                    "Le moteur officiel a besoin de l'autorisation de lecture de votre application Spotify : \
-                       acceptez-la dans le navigateur qui vient de s'ouvrir."
-                        .into(),
-                error: false,
-            });
-            return self.start_app_login(app);
-        }
-        self.send_app_status();
-        self.ui.send(Event::Notice {
-            key: "engine",
-            text: "Moteur officiel : autorisez la lecture dans Réglages → Application Spotify → « Autoriser la lecture ». \
-                   Si Spotify refuse encore, cochez « Web Playback SDK » dans les réglages de votre application \
-                   (tableau de bord Spotify → Settings → Edit)."
-                .into(),
-            error: true,
-        });
-    }
-
-    fn ensure_official(&mut self) -> bool {
-        if self.official.is_some() {
+    fn ensure_engine(&mut self) -> bool {
+        if self.engine.is_some() {
             return true;
         }
         if !self.app_connected {
-            self.ui.error(
-                "Le moteur officiel lit avec votre application Spotify : connectez-la d'abord \
-                 (Réglages → Application Spotify).",
-            );
+            self.ui
+                .error("Connectez votre application Spotify pour écouter (Réglages → Application Spotify).");
             return false;
         }
-        self.official_id += 1;
-        let (id, internal) = (self.official_id, self.internal.clone());
-        log::info!("starting the official engine");
+        self.engine_id += 1;
+        let (id, internal) = (self.engine_id, self.internal.clone());
+        let profile = if self.compatible { Profile::Compatible } else { Profile::Lean };
+        log::info!("starting the engine ({profile:?})");
         self.device_id = None;
+        self.device_prepared = false;
+        self.engine_played = false;
         self.drm.clear();
+        self.last_active = Instant::now();
         self.ui.send(Event::EngineStatus("Démarrage…".into()));
-        self.official =
-            Some(official::Engine::start(self.paths.webview(), self.settings.volume, move |event| {
-                let _ = internal.send(Internal::Official(id, event));
+        self.engine =
+            Some(engine::Engine::start(self.paths.webview(), self.settings.volume, profile, move |event| {
+                let _ = internal.send(Internal::Engine(id, event));
             }));
         true
     }
 
-    fn stop_official(&mut self) {
-        if self.official.take().is_some() {
-            log::info!("official engine stopped");
+    fn stop_engine(&mut self) {
+        if self.engine.take().is_some() {
+            log::info!("engine stopped");
             self.ui.send(Event::EngineMemory(0));
+            self.ui.send(Event::EngineStatus("Arrêté".into()));
         }
         self.device_id = None;
-        self.official_pending = None;
+        self.pending = None;
         self.tracker.clear();
+        if let Some(remote) = &mut self.remote {
+            remote.started = false;
+        }
     }
 
-    fn load_official(&mut self, track: Track, play: bool, position_ms: u32) {
-        self.tracker.clear();
-        self.official_pending = None;
+    /// The lean profile does not play on this PC: WebView2 defaults from now on.
+    fn fall_back_to_compatible(&mut self, reason: &str) {
+        log::warn!("lean engine profile failed ({reason}): compatible profile from now on");
+        self.compatible = true;
+        let _ = std::fs::write(self.paths.cache.join(COMPATIBLE_MARKER), reason);
+        self.stop_engine();
         self.loaded = false;
-        self.send_queue();
-        self.refresh_liked_state(&track);
-        if !play || !self.ensure_official() {
-            if let Some(engine) = &self.official {
-                engine.send(EngineCommand::Pause);
-            }
-            return self.send_playback(false);
-        }
-        self.tracker.expect(track.id.clone(), track.duration_ms);
-        self.loaded = true;
-        self.send_playback(true);
-        self.official_play(self.load_generation, track.id, position_ms);
-    }
-
-    /// Asks Spotify to play the track on the official engine (one Web API call).
-    fn official_play(&mut self, generation: u64, track_id: String, position_ms: u32) {
-        let Some(device) = self.device_id.clone() else {
-            // Started when the engine announces itself.
-            self.official_pending = Some((generation, track_id, position_ms));
-            return;
-        };
-        let (api, internal) = (self.api.clone(), self.internal.clone());
-        tokio::spawn(async move {
-            let mut attempt = 0;
-            let result = loop {
-                match api.play_on_device(&device, &track_id, position_ms).await {
-                    // Spotify's servers learn about a new device a moment after it is ready.
-                    Err(ApiError::NotFound) if attempt < 3 => {
-                        attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
-                    }
-                    other => break other,
-                }
-            };
-            if let Err(e) = result {
-                let _ = internal.send(Internal::OfficialPlayFailed(generation, e));
-            }
+        self.playing = false;
+        self.ui.send(Event::Notice {
+            key: "engine",
+            text: "Le lecteur redémarre en mode compatible (un peu plus de mémoire sur ce PC).".into(),
+            error: false,
         });
+        self.play_pause();
     }
 
-    fn official_play_pause(&mut self, track: Track) {
-        if self.playing {
-            if let Some(engine) = &self.official {
-                engine.send(EngineCommand::Pause);
-            }
-            let position = self.current_position();
-            self.flush_listened();
-            self.playing = false;
-            self.position_ms = position;
-            self.position_at = Instant::now();
-            self.tracker.paused(Instant::now());
-            self.send_playback(false);
-        } else if self.loaded && self.tracker.started() && self.device_id.is_some() {
-            if let Some(engine) = &self.official {
-                engine.send(EngineCommand::Resume);
-            }
-        } else {
-            let position = self.position_ms;
-            self.load(track, true, position);
-        }
-    }
-
-    fn on_official(&mut self, event: EngineEvent) {
+    fn on_engine(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::Ready(device) => {
-                log::info!("official engine ready");
+                log::info!("engine ready");
                 self.device_id = Some(device);
                 self.send_engine_status();
-                if let Some((generation, track_id, position)) = self.official_pending.take()
+                if let Some((generation, request)) = self.pending.take()
                     && generation == self.load_generation
                 {
-                    self.official_play(generation, track_id, position);
+                    self.request_play(request);
                 }
             }
             EngineEvent::NotReady => {
@@ -1569,33 +1182,40 @@ impl Core {
                 self.ui.send(Event::EngineStatus("Reconnexion à Spotify…".into()));
             }
             EngineEvent::NeedToken => {
-                let Some(sender) = self.official.as_ref().map(official::Engine::sender) else { return };
+                let Some(sender) = self.engine.as_ref().map(engine::Engine::sender) else { return };
                 let (api, internal) = (self.api.clone(), self.internal.clone());
                 tokio::spawn(async move {
                     match api.access_token().await {
                         Ok(token) => sender.send(EngineCommand::Token(token)),
                         Err(e) => {
-                            let _ = internal.send(Internal::OfficialTokenFailed(e.to_string()));
+                            let _ = internal.send(Internal::TokenFailed(e.to_string()));
                         }
                     }
                 });
             }
-            EngineEvent::State(Some(state)) => match self.tracker.on_state(&state, Instant::now()) {
-                Progress::Ignore => {}
-                Progress::Started => {
-                    self.unavailable_streak = 0;
-                    self.official_progress(&state);
+            EngineEvent::State(Some(state)) => {
+                if self.remote.is_some() {
+                    self.on_remote_state(state);
+                } else {
+                    match self.tracker.on_state(&state, Instant::now()) {
+                        Progress::Ignore => {}
+                        Progress::Started => {
+                            self.failure_streak = 0;
+                            self.engine_played = true;
+                            self.progress(&state);
+                        }
+                        Progress::Update => self.progress(&state),
+                        Progress::Ended => {
+                            self.flush_listened();
+                            self.playing = false;
+                            self.skip(true);
+                        }
+                    }
                 }
-                Progress::Update => self.official_progress(&state),
-                Progress::Ended => {
-                    self.flush_listened();
-                    self.playing = false;
-                    self.skip(true);
-                }
-            },
+            }
             EngineEvent::State(None) => {
                 // Playback moved to another device (phone, other computer…).
-                if self.tracker.started() {
+                if self.loaded && self.started() {
                     let position = self.current_position();
                     self.flush_listened();
                     self.playing = false;
@@ -1603,40 +1223,69 @@ impl Core {
                     self.position_ms = position;
                     self.position_at = Instant::now();
                     self.tracker.clear();
+                    if let Some(remote) = &mut self.remote {
+                        remote.started = false;
+                    }
                     self.send_playback(false);
                     self.ui.send(Event::Info("La lecture continue sur un autre appareil Spotify.".into()));
                 }
             }
-            EngineEvent::Error(kind, message) => self.on_official_error(kind, message),
+            EngineEvent::Error(kind, message) => self.on_engine_error(kind, message),
             EngineEvent::Drm(systems) => {
-                log::info!("official engine DRM systems: {systems:?}");
-                self.drm = if systems.iter().any(|s| s.contains("playready")) {
-                    "PlayReady".into()
-                } else if systems.iter().any(|s| s.contains("widevine")) {
+                log::info!("DRM systems: {systems:?}");
+                self.drm = if systems.iter().any(|s| s.contains("widevine")) {
                     "Widevine".into()
+                } else if systems.iter().any(|s| s.contains("playready")) {
+                    "PlayReady".into()
                 } else {
                     String::new()
                 };
                 if systems.is_empty() {
                     self.ui.error(
-                        "WebView2 ne propose aucun DRM (Widevine, PlayReady) sur ce PC : le lecteur officiel risque de ne rien lire. \
+                        "WebView2 ne propose aucun DRM (Widevine, PlayReady) sur ce PC : Spotify ne pourra rien lire. \
                          Mettez Windows et Microsoft Edge WebView2 à jour.",
                     );
                 }
                 self.send_engine_status();
             }
-            EngineEvent::Log(message) => log::info!("official engine: {message}"),
-            EngineEvent::Bytes(bytes) => self.official_bytes += bytes,
+            EngineEvent::Log(message) => log::info!("engine: {message}"),
+            EngineEvent::Bytes(bytes) => self.engine_bytes += bytes,
             EngineEvent::Memory(bytes) => self.ui.send(Event::EngineMemory(bytes)),
             EngineEvent::Failed(message) => {
-                self.stop_official();
+                self.stop_engine();
                 self.playing = false;
                 self.loaded = false;
                 self.send_playback(false);
-                self.ui.error(format!("Moteur officiel : {message}"));
+                self.ui.error(format!("Lecteur : {message}"));
                 self.ui.send(Event::EngineStatus(format!("Arrêté : {message}")));
             }
         }
+    }
+
+    fn on_remote_state(&mut self, state: PlayerState) {
+        let Some(remote) = &mut self.remote else { return };
+        let mut changed = None;
+        if let Some(track) = &state.current
+            && remote.current.as_ref().is_none_or(|t| t.id != track.id)
+        {
+            remote.current = Some(track.clone());
+            changed = Some(track.clone());
+        }
+        if !state.paused && !state.loading && !remote.started {
+            remote.started = true;
+            self.failure_streak = 0;
+            self.engine_played = true;
+        }
+        let upcoming_changed = remote.upcoming != state.next;
+        remote.upcoming = state.next.clone();
+        if let Some(track) = changed {
+            self.ui.send(Event::NowPlaying(Some(track.clone())));
+            self.refresh_liked_state(&track);
+        }
+        if upcoming_changed {
+            self.send_queue();
+        }
+        self.progress(&state);
     }
 
     fn send_engine_status(&self) {
@@ -1645,41 +1294,34 @@ impl Core {
         if !self.drm.is_empty() {
             text.push_str(&format!(" · DRM {}", self.drm));
         }
+        if self.compatible {
+            text.push_str(" · mode compatible");
+        }
         self.ui.send(Event::EngineStatus(text));
     }
 
-    fn official_progress(&mut self, state: &PlayerState) {
+    fn progress(&mut self, state: &PlayerState) {
         self.flush_listened();
         self.playing = !state.paused && !state.loading;
         self.position_ms = state.position_ms;
         self.position_at = Instant::now();
+        if self.playing {
+            self.last_active = Instant::now();
+        }
         self.send_playback(state.loading);
     }
 
-    fn on_official_error(&mut self, kind: ErrorKind, message: String) {
-        log::warn!("official engine error {kind:?}: {message}");
+    fn on_engine_error(&mut self, kind: ErrorKind, message: String) {
+        log::warn!("engine error {kind:?}: {message}");
+        // The lean profile is the first suspect while nothing has played yet.
+        let lean_suspect = !self.compatible && !self.engine_played;
         let fatal = match kind {
-            ErrorKind::Playback => return self.official_track_failed(message),
+            ErrorKind::Playback if lean_suspect => return self.fall_back_to_compatible(&message),
+            ErrorKind::Playback => return self.track_failed(message),
+            ErrorKind::Initialization if lean_suspect => return self.fall_back_to_compatible(&message),
             ErrorKind::Authentication => {
-                self.stop_official();
+                self.stop_engine();
                 self.ask_playback_auth(true);
-                true
-            }
-            ErrorKind::Account => {
-                self.ui.error(
-                    "Spotify refuse ce compte au lecteur officiel : un abonnement Premium est nécessaire.",
-                );
-                true
-            }
-            ErrorKind::Initialization => {
-                self.ui.error(format!(
-                    "Le lecteur officiel de Spotify ne peut pas démarrer dans WebView2 ({message}). \
-                     Mettez Windows et Microsoft Edge WebView2 à jour."
-                ));
-                true
-            }
-            ErrorKind::Load => {
-                self.ui.error("Lecteur officiel injoignable (sdk.scdn.co) : vérifiez la connexion Internet.");
                 true
             }
             ErrorKind::Connect => {
@@ -1687,9 +1329,25 @@ impl Core {
                 // right away; otherwise the application or the account is the cause.
                 self.check_playback_scopes(true);
                 self.ui.error(
-                    "Spotify refuse de connecter le lecteur officiel. Vérifiez que « Web Playback SDK » est coché \
+                    "Spotify refuse de connecter le lecteur. Vérifiez que « Web Playback SDK » est coché \
                      dans votre application (tableau de bord Spotify → Settings → Edit) et que le compte est Premium.",
                 );
+                true
+            }
+            ErrorKind::Account => {
+                self.ui.error("Spotify refuse ce compte au lecteur : un abonnement Premium est nécessaire.");
+                true
+            }
+            ErrorKind::Initialization => {
+                self.ui.error(format!(
+                    "Le lecteur de Spotify ne peut pas démarrer dans WebView2 ({message}). \
+                     Mettez Windows et Microsoft Edge WebView2 à jour."
+                ));
+                true
+            }
+            ErrorKind::Load => {
+                self.ui
+                    .error("Lecteur de Spotify injoignable (sdk.scdn.co) : vérifiez la connexion Internet.");
                 true
             }
             ErrorKind::Autoplay => {
@@ -1697,12 +1355,12 @@ impl Core {
                 false
             }
             ErrorKind::Other => {
-                self.ui.error(format!("Moteur officiel : {message}"));
+                self.ui.error(format!("Lecteur : {message}"));
                 false
             }
         };
         if fatal {
-            self.stop_official();
+            self.stop_engine();
             self.ui.send(Event::EngineStatus("Arrêté (erreur)".into()));
         }
         self.playing = false;
@@ -1710,26 +1368,24 @@ impl Core {
         self.send_playback(false);
     }
 
-    /// One track could not be played by the official engine.
-    fn official_track_failed(&mut self, message: String) {
+    /// One track could not be played.
+    fn track_failed(&mut self, message: String) {
         self.playing = false;
         self.loaded = false;
         self.tracker.clear();
-        self.unavailable_streak += 1;
+        self.failure_streak += 1;
         self.send_playback(false);
-        if self.unavailable_streak >= 3 {
-            self.unavailable_streak = 0;
-            return self.ui.error(format!(
-                "Plusieurs titres d'affilée impossibles à lire avec le moteur officiel ({message}) : lecture arrêtée."
-            ));
+        if self.failure_streak >= 3 || self.remote.is_some() {
+            self.failure_streak = 0;
+            return self.ui.error(format!("Lecture impossible ({message}) : lecture arrêtée."));
         }
         let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
         self.ui.error(format!("« {name} » : lecture impossible ({message}). Titre suivant…"));
         self.schedule_skip(Duration::from_millis(1500));
     }
 
-    fn on_official_play_failed(&mut self, error: ApiError) {
-        log::warn!("official engine play request failed: {error}");
+    fn on_play_failed(&mut self, error: ApiError) {
+        log::warn!("play request failed: {error}");
         self.playing = false;
         self.loaded = false;
         self.tracker.clear();
@@ -1740,84 +1396,13 @@ impl Core {
         match error {
             ApiError::NotFound => {
                 // The device is unknown to Spotify: start a fresh engine next time.
-                self.stop_official();
-                self.ui.error("Spotify ne trouve pas le moteur officiel : relancez la lecture.");
+                self.stop_engine();
+                self.ui.error("Spotify ne trouve pas le lecteur : relancez la lecture.");
             }
-            ApiError::NotConnected => self.ui.error(
-                "Connectez votre application Spotify (Réglages → Application Spotify) pour utiliser le moteur officiel.",
-            ),
+            ApiError::NotConnected => {
+                self.ui.error("Connectez votre application Spotify (Réglages → Application Spotify).")
+            }
             other => self.ui.error(format!("Lecture impossible : {other}")),
-        }
-    }
-
-    fn handle_player(&mut self, event: PlayerEvent) {
-        match event {
-            PlayerEvent::PlayRequestIdChanged { .. } => {
-                self.pending_loads = self.pending_loads.saturating_sub(1);
-            }
-            _ if self.pending_loads > 0 => {}
-            PlayerEvent::Playing { position_ms, .. } => {
-                self.flush_listened();
-                self.unavailable_streak = 0;
-                self.reconnect_tried = false;
-                if let Some(first) = self.attempt_quality.take() {
-                    log::warn!(
-                        "key refused at {} kbit/s, accepted at {} kbit/s",
-                        first.kbps(),
-                        self.quality.kbps()
-                    );
-                    self.ui.send(Event::Notice {
-                        key: "quality",
-                        text: format!(
-                            "Lecture en {} kbit/s : Spotify refuse les clés en {} kbit/s. Cette qualité est gardée jusqu'à la fermeture.",
-                            self.quality.kbps(),
-                            first.kbps()
-                        ),
-                        error: false,
-                    });
-                }
-                self.playing = true;
-                self.position_ms = position_ms;
-                self.position_at = Instant::now();
-                self.send_playback(false);
-            }
-            PlayerEvent::Paused { position_ms, .. } => {
-                self.flush_listened();
-                self.playing = false;
-                self.position_ms = position_ms;
-                self.position_at = Instant::now();
-                self.send_playback(false);
-            }
-            PlayerEvent::Seeked { position_ms, .. } | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                self.flush_listened();
-                self.position_ms = position_ms;
-                self.position_at = Instant::now();
-                self.send_playback(false);
-            }
-            PlayerEvent::Loading { position_ms, .. } => {
-                self.position_ms = position_ms;
-                self.send_playback(true);
-            }
-            PlayerEvent::Stopped { .. } => {
-                self.flush_listened();
-                self.playing = false;
-                self.loaded = false;
-                self.send_playback(false);
-            }
-            PlayerEvent::TimeToPreloadNextTrack { .. } => {
-                if let (Some(audio), Some(next)) = (&self.audio, self.queue.peek_next())
-                    && let Ok(id) = SpotifyId::from_base62(&next.id)
-                {
-                    audio.player.preload(SpotifyUri::Track { id });
-                }
-            }
-            PlayerEvent::EndOfTrack { .. } => {
-                self.flush_listened();
-                self.playing = false;
-                self.skip(true);
-            }
-            PlayerEvent::Unavailable { .. } => self.on_unavailable(),
-            _ => {}
         }
     }
 
@@ -1935,6 +1520,7 @@ impl Core {
                 let summary = self.playlists.get(&id).cloned();
                 let title = summary.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Playlist".into());
                 let subtitle = summary.as_ref().map(|p| p.owner.clone()).unwrap_or_default();
+                let total = summary.as_ref().map_or(0, |p| p.total);
                 let key = format!("playlist-{id}");
                 let cached = store.load::<CachedTracks>(&key);
                 let cache_valid = cached.as_ref().is_some_and(|c| match &summary {
@@ -1954,23 +1540,9 @@ impl Core {
                 } else {
                     ui.send(Event::Loading(view.clone()));
                 }
-                let session = self.session.clone();
                 let snapshot = summary.map(|s| s.snapshot_id).unwrap_or_default();
                 tokio::spawn(async move {
-                    let result = match api.playlist_tracks(&id).await {
-                        Ok(tracks) => Ok(tracks),
-                        Err(e @ (ApiError::Forbidden(_) | ApiError::NotFound | ApiError::RateLimited(_))) => {
-                            log::info!("web api refused playlist {id} ({e}), using streaming protocol");
-                            match session {
-                                Some(s) => {
-                                    playlist_via_session(&s, &id).await.map_err(|m| format!("{e} / {m}"))
-                                }
-                                None => Err(e.to_string()),
-                            }
-                        }
-                        Err(e) => Err(e.to_string()),
-                    };
-                    match result {
+                    match api.playlist_tracks(&id).await {
                         Ok(tracks) => {
                             store.save(
                                 &key,
@@ -1978,7 +1550,14 @@ impl Core {
                             );
                             ui.send(Event::Tracks { view, title, subtitle, tracks: Arc::new(tracks) });
                         }
-                        Err(message) => ui.send(Event::ViewFailed { view, message }),
+                        // Development mode applications only read the user's own
+                        // playlists: Spotify can still play the others as a whole.
+                        Err(e @ (ApiError::Forbidden(_) | ApiError::NotFound)) => {
+                            log::info!("playlist {id} not readable ({e}): played as a whole");
+                            let uri = format!("spotify:playlist:{id}");
+                            ui.send(Event::PlaylistContext { view, title, subtitle, uri, total });
+                        }
+                        Err(e) => ui.send(Event::ViewFailed { view, message: e.to_string() }),
                     }
                 });
             }
@@ -2013,15 +1592,9 @@ impl Core {
                     });
                 }
                 ui.send(Event::Loading(view.clone()));
-                let session = self.session.clone();
                 tokio::spawn(async move {
                     match api.artist(&id).await {
-                        Ok((name, mut top, albums)) => {
-                            if top.is_empty()
-                                && let Some(session) = &session
-                            {
-                                top = artist_top_via_session(session, &id).await;
-                            }
+                        Ok((name, top, albums)) => {
                             store.save(
                                 &key,
                                 &CachedArtist {
@@ -2092,11 +1665,7 @@ impl Core {
             Some(event) => self.ui.send(event),
             None => self.ui.send(Event::ViewFailed {
                 view,
-                message: if self.app_connected {
-                    "Hors ligne : contenu non disponible dans le cache.".into()
-                } else {
-                    "Connectez votre application Spotify pour charger ce contenu.".into()
-                },
+                message: "Connectez votre application Spotify pour charger ce contenu.".into(),
             }),
         }
     }
@@ -2174,70 +1743,12 @@ impl Core {
     }
 }
 
-async fn next_player_event(audio: &mut Option<Audio>) -> Option<PlayerEvent> {
-    match audio {
-        Some(audio) => audio.events.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Why librespot gave up on a track, deduced from what it logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaybackFailure {
-    /// Spotify refused the decryption key for good (code 0x0001).
-    KeyDenied,
-    /// Spotify refused the key temporarily (0x0002), even after retries.
-    KeyDeniedTemporarily,
-    KeyTimeout,
-    Region,
-    Format,
-    Download,
-    Unknown,
-}
-
-impl PlaybackFailure {
-    fn from_messages(messages: &[String]) -> Self {
-        let has = |needle: &str| messages.iter().any(|m| m.contains(needle));
-        if has("audio key error 0x0001") || has("error audio key 0 1") {
-            Self::KeyDenied
-        } else if has("audio key error 0x0002") || has("error audio key 0 2") {
-            Self::KeyDeniedTemporarily
-        } else if has("Audio key response timeout") || has("audio key response timeout") {
-            Self::KeyTimeout
-        } else if has("in any supported format") {
-            Self::Format
-        } else if has("Track is unavailable") || has("is not available") {
-            Self::Region
-        } else if has("Unable to load encrypted file") || has("Unable to load audio item") {
-            Self::Download
-        } else {
-            Self::Unknown
-        }
-    }
-
-    fn short(self) -> &'static str {
-        match self {
-            Self::KeyDenied => "Spotify refuse la clé de déchiffrement (code 0x0001).",
-            Self::KeyDeniedTemporarily => "Spotify refuse temporairement la clé de déchiffrement (0x0002).",
-            Self::KeyTimeout => "Spotify ne répond pas à la demande de clé audio.",
-            Self::Region => "titre non disponible pour ce compte ou ce pays.",
-            Self::Format => "aucun format audio compatible.",
-            Self::Download => "téléchargement impossible.",
-            Self::Unknown => "lecture impossible.",
-        }
-    }
-
-    fn stop_message(self) -> String {
-        match self {
-            Self::KeyDenied | Self::KeyDeniedTemporarily | Self::KeyTimeout => format!(
-                "Lecture arrêtée : {} Ce refus vient des serveurs de Spotify et touche en ce moment \
-                 d'autres lecteurs basés sur librespot. Réessayez un peu plus tard.",
-                self.short()
-            ),
-            _ => {
-                format!("Plusieurs titres d'affilée impossibles à lire ({}) : lecture arrêtée.", self.short())
-            }
-        }
+/// Spotify's name for a repeat mode.
+fn repeat_state(mode: Repeat) -> &'static str {
+    match mode {
+        Repeat::Off => "off",
+        Repeat::All => "context",
+        Repeat::One => "track",
     }
 }
 
@@ -2279,63 +1790,6 @@ fn album_event(view: ViewKey, cached: CachedAlbum) -> Event {
     Event::Tracks { view, title: cached.album.name, subtitle, tracks: Arc::new(cached.tracks) }
 }
 
-/// Reads a playlist through Spotify's streaming protocol (used when the Web API
-/// refuses it: development mode applications only read the user's own playlists).
-async fn playlist_via_session(session: &Session, id: &str) -> Result<Vec<Track>, String> {
-    use librespot_metadata::{Metadata, Playlist};
-    let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
-    let playlist = Playlist::get(session, &uri).await.map_err(|e| e.to_string())?;
-    let uris: Vec<SpotifyUri> =
-        playlist.tracks().filter(|u| matches!(u, SpotifyUri::Track { .. })).cloned().collect();
-    Ok(tracks_via_session(session, uris).await)
-}
-
-/// Most popular tracks of an artist in the user's country, read through the
-/// streaming protocol (the Web API endpoint is closed to development mode apps).
-async fn artist_top_via_session(session: &Session, id: &str) -> Vec<Track> {
-    use librespot_metadata::{Artist, Metadata};
-    let Ok(uri) = SpotifyUri::from_uri(&format!("spotify:artist:{id}")) else { return Vec::new() };
-    let Ok(artist) = Artist::get(session, &uri).await else { return Vec::new() };
-    let top = artist.top_tracks.for_country(&session.country());
-    tracks_via_session(session, top.0.into_iter().take(10).collect()).await
-}
-
-/// Track metadata through the streaming protocol, 8 requests at a time.
-async fn tracks_via_session(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track> {
-    use librespot_metadata::Metadata;
-    futures_util::stream::iter(uris)
-        .map(|uri| {
-            let session = session.clone();
-            async move {
-                let t = librespot_metadata::Track::get(&session, &uri).await.ok()?;
-                Some(Track {
-                    id: uri.to_id().ok()?,
-                    name: t.name,
-                    artists: t
-                        .artists
-                        .iter()
-                        .map(|a| ArtistRef { id: a.id.to_id().unwrap_or_default(), name: a.name.clone() })
-                        .collect(),
-                    album: t.album.name.clone(),
-                    album_id: t.album.id.to_id().unwrap_or_default(),
-                    duration_ms: t.duration.max(0) as u32,
-                    image: t
-                        .album
-                        .covers
-                        .iter()
-                        .min_by_key(|c| c.width)
-                        .and_then(|c| c.id.to_base16().ok())
-                        .map(|hex| format!("https://i.scdn.co/image/{hex}")),
-                    playable: true,
-                })
-            }
-        })
-        .buffered(8)
-        .filter_map(std::future::ready)
-        .collect::<Vec<_>>()
-        .await
-}
-
 fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {
     let image = image::load_from_memory(bytes).ok()?;
     // Covers are displayed at 56 px at most: never keep more pixels than needed.
@@ -2343,10 +1797,6 @@ fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
-}
-
-fn volume_to_u16(volume: f32) -> u16 {
-    (volume.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16
 }
 
 /// Size in French notation ("1,5 Mo").
@@ -2371,39 +1821,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explains_playback_failures() {
-        let from = |lines: &[&str]| {
-            PlaybackFailure::from_messages(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>())
-        };
-        assert_eq!(
-            from(&["error audio key 0 1", "Unable to load key, continuing without decryption: x"]),
-            PlaybackFailure::KeyDenied
-        );
-        assert_eq!(
-            from(&["Unable to load key: Service unavailable { audio key error 0x0002 }"]),
-            PlaybackFailure::KeyDeniedTemporarily
-        );
-        assert_eq!(from(&["Audio key response timeout"]), PlaybackFailure::KeyTimeout);
-        assert_eq!(from(&["spotify:track:<abc> is not available"]), PlaybackFailure::Region);
-        assert_eq!(from(&["<x> is not available in any supported format"]), PlaybackFailure::Format);
-        assert_eq!(from(&[]), PlaybackFailure::Unknown);
-        crate::logger::remember_for_test("error audio key 0 1");
-        let recent = crate::logger::playback_messages_since(Instant::now() - Duration::from_secs(5));
-        assert_eq!(PlaybackFailure::from_messages(&recent), PlaybackFailure::KeyDenied);
+    fn repeat_modes_map_to_spotify() {
+        assert_eq!(repeat_state(Repeat::Off), "off");
+        assert_eq!(repeat_state(Repeat::All), "context");
+        assert_eq!(repeat_state(Repeat::One), "track");
     }
 
     #[test]
-    fn refused_keys_climb_through_qualities() {
-        assert_eq!(next_quality(Quality::Eco), Some(Quality::Normal));
-        assert_eq!(next_quality(Quality::Normal), Some(Quality::High));
-        assert_eq!(next_quality(Quality::High), None);
-    }
-
-    #[test]
-    fn volume_mapping() {
-        assert_eq!(volume_to_u16(0.0), 0);
-        assert_eq!(volume_to_u16(1.0), u16::MAX);
-        assert_eq!(volume_to_u16(2.0), u16::MAX);
+    fn explains_authorization_errors() {
+        assert!(app_error_hint("400 : invalid_client").contains("Client Secret"));
+        assert!(app_error_hint("Illegal redirect_uri").contains("redirection"));
+        assert!(app_error_hint("autre").contains("autre"));
     }
 
     #[test]

@@ -6,8 +6,6 @@
 pub struct Memory {
     /// What the Windows Task Manager shows ("private working set").
     pub private_working_set: u64,
-    /// Total physical memory currently mapped, shared libraries included.
-    pub working_set: u64,
 }
 
 #[cfg(windows)]
@@ -40,11 +38,10 @@ pub fn memory() -> Memory {
         } else {
             counters.PrivateUsage as u64
         },
-        working_set: counters.WorkingSetSize as u64,
     }
 }
 
-/// Private working set of another process (the WebView2 processes of the official
+/// Private working set of another process (the WebView2 processes of the playback
 /// engine), 0 if it cannot be read.
 #[cfg(windows)]
 pub fn process_memory(pid: u32) -> u64 {
@@ -90,7 +87,7 @@ pub fn memory() -> Memory {
     let page = 4096;
     let resident = fields.get(1).copied().unwrap_or(0) * page;
     let shared = fields.get(2).copied().unwrap_or(0) * page;
-    Memory { private_working_set: resident.saturating_sub(shared), working_set: resident }
+    Memory { private_working_set: resident.saturating_sub(shared) }
 }
 
 /// Hands pages that are not in active use back to the system (Windows only). They
@@ -112,8 +109,6 @@ pub fn trim_working_set() {}
 mod tests {
     #[test]
     fn reports_some_memory() {
-        let m = super::memory();
-        assert!(m.working_set > 0);
-        assert!(m.private_working_set <= m.working_set || cfg!(windows));
+        assert!(super::memory().private_working_set > 0);
     }
 }

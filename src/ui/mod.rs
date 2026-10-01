@@ -1,4 +1,5 @@
-//! The interface: a sidebar, a content panel and a player bar.
+//! The interface: a sidebar, a content panel and a player bar, as rounded
+//! surfaces on a black window.
 //!
 //! Rendering is reactive: nothing is redrawn unless something happens (input,
 //! backend event, or once per second while music plays), so the CPU stays idle.
@@ -11,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Key, Modifiers, TextureHandle, TextureOptions};
+use egui::{Key, Modifiers, TextureHandle, TextureOptions};
 
 use crate::backend::{AppState, AppStatus, Backend, Command, Event};
 use crate::config::{Paths, Settings};
@@ -26,20 +27,28 @@ const MAX_PAGES: usize = 12;
 const MAX_TEXTURES: usize = 48;
 
 pub enum Page {
-    Tracks { title: String, subtitle: String, tracks: Arc<Vec<Track>> },
-    Albums { title: String, albums: Vec<AlbumSummary> },
-    Artist { name: String, top: Arc<Vec<Track>>, albums: Vec<AlbumSummary> },
+    Tracks {
+        title: String,
+        subtitle: String,
+        tracks: Arc<Vec<Track>>,
+    },
+    /// A playlist Spotify only plays as a whole (its tracks are not readable).
+    Context {
+        title: String,
+        subtitle: String,
+        uri: String,
+        total: u32,
+    },
+    Albums {
+        title: String,
+        albums: Vec<AlbumSummary>,
+    },
+    Artist {
+        name: String,
+        top: Arc<Vec<Track>>,
+        albums: Vec<AlbumSummary>,
+    },
     Search(SearchResults),
-}
-
-#[derive(Clone, PartialEq)]
-enum Auth {
-    Unknown,
-    NeedLogin,
-    Pending { url: String },
-    Connecting,
-    LoggedIn,
-    Offline,
 }
 
 #[derive(Default)]
@@ -51,6 +60,8 @@ struct Player {
     at: Option<Instant>,
     liked: HashMap<String, bool>,
     upcoming: Vec<Track>,
+    /// Playlist or artist that Spotify plays itself, if any.
+    context: Option<String>,
     shuffle: bool,
     repeat: Repeat,
     volume_before_mute: Option<f32>,
@@ -104,7 +115,6 @@ pub struct App {
     paths: Paths,
     settings: Settings,
     palette: Palette,
-    auth: Auth,
     user: String,
     /// The user's own Spotify application (library, search).
     app_status: AppStatus,
@@ -123,13 +133,11 @@ pub struct App {
     reveal_selected: bool,
     player: Player,
     covers: Covers,
-    /// Tracks Spotify refuses to third-party clients (greyed out, skipped).
-    refused: HashSet<String>,
     toasts: Vec<Toast>,
     usage: (u64, u64),
     memory: sys::Memory,
     memory_at: Option<Instant>,
-    /// State of the official engine and memory of its WebView2 processes.
+    /// State of the playback engine and memory of its WebView2 processes.
     engine_status: String,
     engine_memory: u64,
     media: MediaKeys,
@@ -146,8 +154,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, settings: Settings) -> Self {
-        let ctx = &cc.egui_ctx;
+    pub fn new(
+        ctx: &egui::Context,
+        window: &winit::window::Window,
+        paths: Paths,
+        settings: Settings,
+    ) -> Self {
         theme::install_fonts(ctx);
         let palette = Palette::amoled();
         theme::apply(ctx, &palette);
@@ -155,7 +167,7 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
 
         let backend = Backend::spawn(ctx.clone(), paths.clone(), settings.clone());
-        let media = MediaKeys::new(cc);
+        let media = MediaKeys::new(window, ctx.clone());
         let player = Player { shuffle: settings.shuffle, repeat: settings.repeat, ..Player::default() };
         Self {
             backend,
@@ -166,7 +178,6 @@ impl App {
             port_draft: settings.redirect_port.to_string(),
             paths,
             palette,
-            auth: Auth::Unknown,
             user: String::new(),
             app_status: AppStatus {
                 state: AppState::Unknown,
@@ -189,7 +200,6 @@ impl App {
             reveal_selected: false,
             player,
             covers: Covers::default(),
-            refused: HashSet::new(),
             toasts: Vec::new(),
             usage: (0, 0),
             memory: sys::memory(),
@@ -211,7 +221,6 @@ impl App {
             return self;
         }
         self.demo = true;
-        self.auth = Auth::LoggedIn;
         self.user = "Démo".into();
         let names =
             ["Lueurs", "Minuit passé", "Rivages", "Sur le fil", "Horizon bas", "Nocturne", "Papier", "Écho"];
@@ -249,7 +258,6 @@ impl App {
         self.player.at = Some(Instant::now());
         self.player.liked.insert(tracks[2].id.clone(), true);
         self.player.upcoming = tracks[3..12].to_vec();
-        self.refused.insert(tracks[5].id.clone());
         self.app_status.state = if std::env::var_os("SPOTILITE_DEMO_SETUP").is_some() {
             AppState::NotConfigured
         } else {
@@ -260,11 +268,8 @@ impl App {
             ViewKey::Liked,
             Page::Tracks { title: "Titres likés".into(), subtitle: String::new(), tracks: Arc::new(tracks) },
         );
-        if std::env::var_os("SPOTILITE_DEMO_OFFICIAL").is_some() {
-            self.settings.engine = crate::config::Engine::Official;
-            self.engine_status = "Prêt · DRM Widevine".into();
-            self.engine_memory = 118 * 1024 * 1024;
-        }
+        self.engine_status = "Prêt · DRM Widevine".into();
+        self.engine_memory = 112 * 1024 * 1024;
         if let Ok(view) = std::env::var("SPOTILITE_DEMO_VIEW") {
             self.view = match view.as_str() {
                 "settings" => ViewKey::Settings,
@@ -351,33 +356,7 @@ impl App {
             Event::Info(text) => self.toast(text, false),
             Event::Error(text) => self.toast(text, true),
             Event::Notice { key, text, error } => self.toast_keyed(Some(key), text, error),
-            Event::Refused(ids) => self.refused = ids,
-            Event::TrackRefused(id) => {
-                self.refused.insert(id);
-            }
-            Event::NeedLogin => self.auth = Auth::NeedLogin,
-            Event::LoginPending { url } => self.auth = Auth::Pending { url },
-            Event::Offline => {
-                if self.auth != Auth::LoggedIn {
-                    self.auth = Auth::Offline;
-                    if self.view == ViewKey::Welcome {
-                        self.navigate(ViewKey::Liked);
-                    }
-                }
-            }
-            Event::Connecting => {
-                if !matches!(self.auth, Auth::LoggedIn | Auth::Offline) {
-                    self.auth = Auth::Connecting;
-                }
-            }
-            Event::LoggedIn { user } => {
-                let first = self.auth != Auth::LoggedIn;
-                self.auth = Auth::LoggedIn;
-                self.user = user;
-                if first && self.view == ViewKey::Welcome {
-                    self.navigate(ViewKey::Liked);
-                }
-            }
+            Event::LoggedIn { user } => self.user = user,
             Event::App(status) => self.on_app_status(status),
             Event::Playlists(list) => self.playlists = list,
             Event::Loading(view) => {
@@ -386,6 +365,9 @@ impl App {
             }
             Event::Tracks { view, title, subtitle, tracks } => {
                 self.store_page(view, Page::Tracks { title, subtitle, tracks });
+            }
+            Event::PlaylistContext { view, title, subtitle, uri, total } => {
+                self.store_page(view, Page::Context { title, subtitle, uri, total });
             }
             Event::Albums { view, title, albums } => self.store_page(view, Page::Albums { title, albums }),
             Event::Artist { id, name, top, albums } => {
@@ -409,8 +391,9 @@ impl App {
                 self.player.at = Some(Instant::now());
                 self.media.set_playback(playing, position_ms);
             }
-            Event::Queue { upcoming, shuffle, repeat } => {
+            Event::Queue { upcoming, shuffle, repeat, context } => {
                 self.player.upcoming = upcoming;
+                self.player.context = context;
                 self.player.shuffle = shuffle;
                 self.player.repeat = repeat;
             }
@@ -478,6 +461,13 @@ impl App {
         self.send(Command::Play { tracks, index });
     }
 
+    /// Lets Spotify play a whole playlist or artist.
+    fn play_context(&mut self, uri: String, title: String, shuffle: bool, total: u32) {
+        self.player.shuffle = shuffle;
+        self.settings.shuffle = shuffle;
+        self.send(Command::PlayContext { uri, title, shuffle, total });
+    }
+
     fn toggle_like_current(&mut self) {
         if let Some(track) = self.player.now.clone() {
             let liked = !self.player.is_liked().unwrap_or(false);
@@ -527,7 +517,7 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if !matches!(self.auth, Auth::LoggedIn | Auth::Offline) {
+        if self.needs_setup() {
             return;
         }
         let typing = ctx.text_edit_focused();
@@ -609,7 +599,7 @@ impl App {
             Page::Tracks { tracks, .. } => tracks.clone(),
             Page::Artist { top, .. } => top.clone(),
             Page::Search(results) => results.tracks.clone(),
-            Page::Albums { .. } => return None,
+            Page::Albums { .. } | Page::Context { .. } => return None,
         };
         let query = self.filter.trim().to_lowercase();
         if query.is_empty() {
@@ -688,32 +678,28 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl crate::window::App for App {
+    fn logic(&mut self, ctx: &egui::Context) {
         self.drain_events(ctx);
         self.handle_media_keys(ctx);
         self.housekeeping(ctx);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             self.settings.window_size = [rect.width() * ctx.zoom_factor(), rect.height() * ctx.zoom_factor()];
         }
-        match self.auth {
-            Auth::LoggedIn | Auth::Offline if self.needs_setup() => views::setup_screen(self, ui),
-            Auth::LoggedIn | Auth::Offline => views::main_layout(self, ui),
-            _ => views::login_screen(self, ui),
+        match self.app_status.state {
+            AppState::Unknown => views::splash(self, ui),
+            _ if self.needs_setup() => views::setup_screen(self, ui),
+            _ => views::main_layout(self, ui),
         }
         views::toasts(self, &ctx);
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        self.palette.bg.to_normalized_gamma_f32()
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.settings.save(&self.paths);
         self.backend.shutdown();
     }

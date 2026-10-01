@@ -1,0 +1,32 @@
+# egui_software_backend 0.0.3 (MIT OR Apache-2.0), ported to egui 0.36 for SpotiLite:
+# the interface is drawn by the CPU, so no OpenGL driver is loaded in the process.
+# See README-SpotiLite.md.
+[package]
+edition = "2024"
+name = "egui_software_backend"
+version = "0.0.3"
+description = "A CPU software render backend for egui."
+homepage = "https://github.com/DGriffin91/egui_software_backend"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DGriffin91/egui_software_backend"
+autoexamples = false
+autotests = false
+autobenches = false
+
+[features]
+default = ["std"]
+std = []
+raster_stats = ["std"]
+
+[lib]
+name = "egui_software_backend"
+path = "src/lib.rs"
+
+[dependencies]
+constify = "0.0.1"
+egui = { version = "0.36", default-features = false }
+strength_reduce = "0.2.4"
+
+[lints.rust]
+# Optional features of the original crate (rayon, log, test_render) are not carried over.
+unexpected_cfgs = "allow"

@@ -186,7 +186,7 @@ impl WebApi {
         }
     }
 
-    /// A valid access token of the user's application (for the official engine).
+    /// A valid access token of the user's application (for the playback engine).
     pub async fn access_token(&self) -> ApiResult<String> {
         self.token().await
     }
@@ -460,14 +460,48 @@ impl WebApi {
     }
 
     /// Downloads a cover image (public CDN, no token needed).
-    /// Starts a track on a Spotify device (the official engine), from `position_ms`.
-    pub async fn play_on_device(&self, device_id: &str, track_id: &str, position_ms: u32) -> ApiResult<()> {
-        let url =
-            reqwest::Url::parse_with_params(&format!("{API}/me/player/play"), &[("device_id", device_id)])
-                .map_err(|e| ApiError::Parse(e.to_string()))?;
-        let body =
-            serde_json::json!({ "uris": [format!("spotify:track:{track_id}")], "position_ms": position_ms });
-        self.request_with(Method::PUT, url.as_str(), Some(&body)).await.map(drop)
+    /// Starts playback on a Spotify device (the playback engine).
+    pub async fn play_on_device(&self, device_id: &str, what: &PlayRequest) -> ApiResult<()> {
+        let body = match what {
+            PlayRequest::Track { id, position_ms } => {
+                serde_json::json!({ "uris": [format!("spotify:track:{id}")], "position_ms": position_ms })
+            }
+            PlayRequest::Context { uri, offset, position_ms } => {
+                let mut body = serde_json::json!({ "context_uri": uri });
+                match offset {
+                    Some(Offset::Position(n)) => body["offset"] = serde_json::json!({ "position": n }),
+                    Some(Offset::Track(id)) => {
+                        body["offset"] = serde_json::json!({ "uri": format!("spotify:track:{id}") });
+                    }
+                    None => {}
+                }
+                if *position_ms > 0 {
+                    body["position_ms"] = serde_json::json!(position_ms);
+                }
+                body
+            }
+        };
+        let url = player_url("play", device_id, &[])?;
+        self.request_with(Method::PUT, &url, Some(&body)).await.map(drop)
+    }
+
+    /// Shuffle of what Spotify plays itself (a playlist or an artist).
+    pub async fn set_shuffle(&self, device_id: &str, on: bool) -> ApiResult<()> {
+        let url = player_url("shuffle", device_id, &[("state", if on { "true" } else { "false" })])?;
+        self.request(Method::PUT, &url).await.map(drop)
+    }
+
+    /// `state`: "off", "context" or "track".
+    pub async fn set_repeat(&self, device_id: &str, state: &str) -> ApiResult<()> {
+        let url = player_url("repeat", device_id, &[("state", state)])?;
+        self.request(Method::PUT, &url).await.map(drop)
+    }
+
+    /// Adds a track to Spotify's own queue (while it plays a playlist or an artist).
+    pub async fn add_to_queue(&self, device_id: &str, track_id: &str) -> ApiResult<()> {
+        let uri = format!("spotify:track:{track_id}");
+        let url = player_url("queue", device_id, &[("uri", uri.as_str())])?;
+        self.request(Method::POST, &url).await.map(drop)
     }
 
     pub async fn download(&self, url: &str) -> ApiResult<Vec<u8>> {
@@ -479,6 +513,31 @@ impl WebApi {
         self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(bytes.to_vec())
     }
+}
+
+/// What to start on the playback engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayRequest {
+    /// One track, chosen by SpotiLite's own queue.
+    Track { id: String, position_ms: u32 },
+    /// A playlist or an artist that Spotify plays itself (development mode
+    /// applications cannot read playlists of other users nor top tracks).
+    Context { uri: String, offset: Option<Offset>, position_ms: u32 },
+}
+
+/// Where to start in a context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Offset {
+    Position(u32),
+    Track(String),
+}
+
+fn player_url(action: &str, device_id: &str, params: &[(&str, &str)]) -> ApiResult<String> {
+    let mut query = vec![("device_id", device_id)];
+    query.extend_from_slice(params);
+    reqwest::Url::parse_with_params(&format!("{API}/me/player/{action}"), &query)
+        .map(String::from)
+        .map_err(|e| ApiError::Parse(e.to_string()))
 }
 
 fn gunzip(raw: &[u8]) -> ApiResult<Vec<u8>> {
@@ -665,6 +724,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn player_urls_carry_the_device() {
+        let url = player_url("queue", "dev 1", &[("uri", "spotify:track:abc")]).unwrap();
+        assert_eq!(
+            url,
+            "https://api.spotify.com/v1/me/player/queue?device_id=dev+1&uri=spotify%3Atrack%3Aabc"
+        );
+    }
+
     #[tokio::test]
     async fn saves_restores_and_forgets_the_application() {
         let dir = std::env::temp_dir().join(format!("spotilite-webapi-{}", std::process::id()));
@@ -688,7 +756,7 @@ mod tests {
         };
         api.connect(app.clone(), token).await;
         assert_eq!(
-            api.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES).await.unwrap(),
+            api.missing_scopes(auth::PLAYBACK_SCOPES).await.unwrap(),
             vec!["user-read-email", "user-modify-playback-state"]
         );
         assert!(api.restore().await, "authorization survives a restart");

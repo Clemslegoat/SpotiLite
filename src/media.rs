@@ -25,7 +25,7 @@ pub struct MediaKeys;
 
 #[cfg(not(windows))]
 impl MediaKeys {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_window: &winit::window::Window, _ctx: egui::Context) -> Self {
         Self
     }
 
@@ -60,9 +60,9 @@ mod windows_impl {
     }
 
     impl MediaKeys {
-        pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        pub fn new(window: &winit::window::Window, ctx: egui::Context) -> Self {
             let (tx, rx) = channel();
-            let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
+            let hwnd = window.window_handle().ok().and_then(|h| match h.as_raw() {
                 RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut std::ffi::c_void),
                 _ => None,
             });
@@ -70,7 +70,6 @@ mod windows_impl {
                 let config =
                     PlatformConfig { display_name: "SpotiLite", dbus_name: "spotilite", hwnd: Some(hwnd) };
                 let mut controls = MediaControls::new(config).ok()?;
-                let ctx = cc.egui_ctx.clone();
                 controls
                     .attach(move |event| {
                         let action = match event {

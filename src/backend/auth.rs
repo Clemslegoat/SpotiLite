@@ -17,24 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-/// Client id of Spotify's desktop application. Only this kind of client id can open
-/// an audio streaming session (this is what every librespot based player uses).
-pub const SPOTIFY_DESKTOP_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
-
-pub const STREAMING_SCOPES: &[&str] = &[
-    "streaming",
-    "user-read-private",
-    "user-read-email",
-    "playlist-read-private",
-    "playlist-read-collaborative",
-    "user-library-read",
-    "user-library-modify",
-    "user-read-playback-state",
-    "user-modify-playback-state",
-];
-
 /// Scopes requested for the user's own Spotify application: library and search,
-/// plus what the official engine (Web Playback SDK) needs.
+/// plus what the playback engine (Web Playback SDK) needs.
 pub const WEB_API_SCOPES: &[&str] = &[
     "user-read-private",
     "playlist-read-private",
@@ -47,8 +31,9 @@ pub const WEB_API_SCOPES: &[&str] = &[
     "user-modify-playback-state",
 ];
 
-/// Scopes without which the official engine cannot play.
-pub const OFFICIAL_ENGINE_SCOPES: &[&str] =
+/// Scopes without which the playback engine cannot play (authorizations given to
+/// version 0.1 lack them).
+pub const PLAYBACK_SCOPES: &[&str] =
     &["streaming", "user-read-email", "user-read-private", "user-modify-playback-state"];
 
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
@@ -153,8 +138,8 @@ pub fn code_challenge(verifier: &str) -> String {
 }
 
 impl AuthFlow {
-    /// Prepares the flow. `port = 0` picks a free port (allowed for Spotify's desktop
-    /// client id); the user's application needs the exact redirect URI it registered.
+    /// Prepares the flow on the redirect URI registered by the application (`port = 0`
+    /// picks a free port, for tests).
     pub fn start(app: AppCredentials, port: u16, scopes: &[&str]) -> Result<Self, AuthError> {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| AuthError::Bind(format!("127.0.0.1:{port} : {e}")))?;
@@ -383,12 +368,12 @@ mod tests {
             scope: scope.into(),
         };
         assert_eq!(
-            token("user-read-private user-library-read").missing_scopes(OFFICIAL_ENGINE_SCOPES),
+            token("user-read-private user-library-read").missing_scopes(PLAYBACK_SCOPES),
             vec!["streaming", "user-read-email", "user-modify-playback-state"]
         );
-        assert!(token(&WEB_API_SCOPES.join(" ")).missing_scopes(OFFICIAL_ENGINE_SCOPES).is_empty());
+        assert!(token(&WEB_API_SCOPES.join(" ")).missing_scopes(PLAYBACK_SCOPES).is_empty());
         // Unknown grant: assume it is fine and let Spotify say otherwise.
-        assert!(token("").missing_scopes(OFFICIAL_ENGINE_SCOPES).is_empty());
+        assert!(token("").missing_scopes(PLAYBACK_SCOPES).is_empty());
     }
 
     #[test]

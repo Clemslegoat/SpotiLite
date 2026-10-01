@@ -7,65 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Repeat;
 
-/// Streaming quality. Lower bitrates use proportionally less data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Quality {
-    /// 96 kbit/s Ogg Vorbis, about 43 MB per hour.
-    #[default]
-    Eco,
-    /// 160 kbit/s, about 72 MB per hour.
-    Normal,
-    /// 320 kbit/s, about 144 MB per hour.
-    High,
-}
-
-impl Quality {
-    pub const ALL: [Quality; 3] = [Quality::Eco, Quality::Normal, Quality::High];
-
-    pub fn kbps(self) -> u32 {
-        match self {
-            Quality::Eco => 96,
-            Quality::Normal => 160,
-            Quality::High => 320,
-        }
-    }
-
-    /// Approximate data used per hour of listening, in megabytes.
-    pub fn mb_per_hour(self) -> u32 {
-        self.kbps() * 3600 / 8 / 1000
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Quality::Eco => "Éco",
-            Quality::Normal => "Normale",
-            Quality::High => "Haute",
-        }
-    }
-}
-
-/// What plays the audio.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Engine {
-    /// librespot inside SpotiLite: lightest, bitrate choice, audio cache.
-    #[default]
-    Native,
-    /// Spotify's own Web Playback SDK in an invisible WebView2 (Widevine or PlayReady DRM):
-    /// plays the tracks whose keys Spotify refuses to librespot, uses more memory.
-    Official,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub engine: Engine,
-    pub quality: Quality,
     /// Download album covers (64 px thumbnails, cached on disk).
     pub show_covers: bool,
-    /// Audio cache size in MB. Replaying a cached track costs no data. 0 disables it.
-    pub audio_cache_mb: u64,
     pub volume: f32,
-    pub normalisation: bool,
     pub ui_scale: f32,
     pub shuffle: bool,
     pub repeat: Repeat,
@@ -76,25 +23,25 @@ pub struct Settings {
     pub redirect_port: u16,
     /// Release unused memory pages when the window is minimized (Windows only).
     pub trim_when_minimized: bool,
+    /// Stop the playback engine (its WebView2 processes) after this many minutes
+    /// without playing; 0 keeps it running.
+    pub engine_idle_minutes: u32,
     pub window_size: [f32; 2],
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            engine: Engine::Native,
-            quality: Quality::Eco,
             show_covers: true,
-            audio_cache_mb: 1024,
             volume: 0.7,
-            normalisation: true,
             ui_scale: 1.0,
             shuffle: false,
             repeat: Repeat::Off,
             legacy_client_id: String::new(),
             redirect_port: 8898,
             trim_when_minimized: true,
-            window_size: [980.0, 640.0],
+            engine_idle_minutes: 10,
+            window_size: [1040.0, 680.0],
         }
     }
 }
@@ -121,6 +68,7 @@ impl Settings {
 
     fn sanitized(mut self) -> Self {
         self.volume = self.volume.clamp(0.0, 1.0);
+        self.engine_idle_minutes = self.engine_idle_minutes.min(240);
         self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
         self.legacy_client_id = self.legacy_client_id.trim().to_string();
         if self.redirect_port == 0 {
@@ -197,7 +145,8 @@ impl Paths {
         self.cache.join("spotilite.log")
     }
 
-    pub fn audio_cache(&self) -> PathBuf {
+    /// Audio cache of version 0.1 (librespot), deleted at startup.
+    pub fn legacy_audio_cache(&self) -> PathBuf {
         self.cache.join("audio")
     }
 
@@ -209,11 +158,12 @@ impl Paths {
         self.cache.join("library")
     }
 
-    pub fn tmp(&self) -> PathBuf {
+    /// Temporary files of version 0.1 (librespot), deleted at startup.
+    pub fn legacy_tmp(&self) -> PathBuf {
         self.cache.join("tmp")
     }
 
-    /// Profile of the official engine (WebView2).
+    /// Profile of the playback engine (WebView2).
     pub fn webview(&self) -> PathBuf {
         self.cache.join("webview")
     }
@@ -234,18 +184,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_estimates() {
-        assert_eq!(Quality::Eco.mb_per_hour(), 43);
-        assert_eq!(Quality::Normal.mb_per_hour(), 72);
-        assert_eq!(Quality::High.mb_per_hour(), 144);
-    }
-
-    #[test]
     fn partial_settings_file_keeps_defaults() {
-        let s: Settings = serde_json::from_str(r#"{"quality":"High","volume":3.0}"#).unwrap();
+        // Fields of version 0.1 (quality, engine…) are ignored.
+        let s: Settings =
+            serde_json::from_str(r#"{"quality":"High","engine":"Official","volume":3.0}"#).unwrap();
         let s = s.sanitized();
-        assert_eq!(s.quality, Quality::High);
         assert_eq!(s.volume, 1.0);
+        assert_eq!(s.engine_idle_minutes, 10);
         assert!(s.show_covers);
         assert_eq!(s.redirect_port, 8898);
     }
@@ -258,5 +203,6 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("client_id"));
         assert!(!json.contains("theme"));
+        assert!(!json.contains("quality"));
     }
 }

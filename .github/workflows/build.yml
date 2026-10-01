@@ -21,13 +21,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --locked
-      - name: Official engine (WebView2 + Spotify SDK, informative)
+      - name: Playback engine (WebView2 + Spotify SDK, memory of both profiles, informative)
         continue-on-error: true
         run: cargo test --locked -- --ignored --nocapture
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build (release)
         run: cargo build --locked --release
+      - name: Memory of SpotiLite (informative)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $env:SPOTILITE_HOME = "$env:RUNNER_TEMP\spotilite-memory"
+          $process = Start-Process -FilePath target/release/spotilite.exe -PassThru
+          Start-Sleep -Seconds 15
+          $counter = (Get-Counter "\Process(spotilite)\Working Set - Private").CounterSamples[0].CookedValue
+          $process.Refresh()
+          "SpotiLite (setup screen): private working set {0:N1} MB, private bytes {1:N1} MB, threads {2}" -f ($counter / 1MB), ($process.PrivateMemorySize64 / 1MB), $process.Threads.Count
+          Stop-Process -Id $process.Id
       - name: Package
         shell: pwsh
         run: |
