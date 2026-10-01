@@ -46,6 +46,11 @@ d'Edge comme dans un navigateur.
 | SpotiLite (interface) | Rendu par le processeur dans un tampon de pixels : aucun pilote graphique chargé (c'est souvent le plus gros poste d'une petite application). Polices du système projetées en mémoire au lieu d'être copiées. Un seul fil réseau. Au plus 48 vignettes de 128 px et 12 pages gardées en mémoire. Mémoire rendue à Windows quand la fenêtre est réduite. |
 | Lecteur (processus WebView2) | Ne démarre qu'à la première lecture. Profil allégé : pas de processus GPU, un seul processus de rendu, sortie audio dans le processus principal, petit cache disque, objectif mémoire « bas » de WebView2. Mis **en veille** après une pause (5, 10 ou 30 min, ou jamais) : ses processus se ferment et rendent toute leur mémoire. Si le profil allégé ne fonctionne pas sur un PC, SpotiLite passe tout seul en mode compatible. |
 
+Mesures sous Windows (intégration continue, Windows Server 2025) : **SpotiLite 6,7 Mo** à
+l'ouverture (ensemble de travail privé, la valeur du Gestionnaire des tâches ; un peu plus une fois
+la bibliothèque et les pochettes affichées), **lecteur 121 Mo** en profil allégé (131 Mo en mode
+compatible) pendant qu'il tourne, **0 Mo** une fois en veille.
+
 Les deux valeurs sont visibles en permanence en bas à gauche (« RAM … + lecteur … »), et en détail
 dans *Réglages → Mémoire*.
 
