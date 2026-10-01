@@ -33,14 +33,23 @@ pub const STREAMING_SCOPES: &[&str] = &[
     "user-modify-playback-state",
 ];
 
-/// Scopes requested for the user's own Spotify application (library and search).
+/// Scopes requested for the user's own Spotify application: library and search,
+/// plus what the official engine (Web Playback SDK) needs.
 pub const WEB_API_SCOPES: &[&str] = &[
     "user-read-private",
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
     "user-library-modify",
+    "streaming",
+    "user-read-email",
+    "user-read-playback-state",
+    "user-modify-playback-state",
 ];
+
+/// Scopes without which the official engine cannot play.
+pub const OFFICIAL_ENGINE_SCOPES: &[&str] =
+    &["streaming", "user-read-email", "user-read-private", "user-modify-playback-state"];
 
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -92,6 +101,19 @@ pub struct OAuthToken {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Instant,
+    /// Granted scopes, space separated (empty when unknown).
+    pub scope: String,
+}
+
+impl OAuthToken {
+    /// Scopes of `wanted` that were not granted (none when the grant is unknown).
+    pub fn missing_scopes<'a>(&self, wanted: &[&'a str]) -> Vec<&'a str> {
+        if self.scope.trim().is_empty() {
+            return Vec::new();
+        }
+        let granted: Vec<&str> = self.scope.split_whitespace().collect();
+        wanted.iter().copied().filter(|s| !granted.contains(s)).collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -99,6 +121,8 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     #[serde(default = "default_expiry")]
     expires_in: u64,
 }
@@ -298,6 +322,7 @@ async fn post_token(
             .filter(|t| !t.is_empty())
             .or_else(|| previous_refresh.map(str::to_string)),
         expires_at: Instant::now() + Duration::from_secs(parsed.expires_in.saturating_sub(60)),
+        scope: parsed.scope.unwrap_or_default(),
     })
 }
 
@@ -347,6 +372,23 @@ mod tests {
         // base64("abc:s3cr3t")
         assert_eq!(basic_auth(&app("abc", "s3cr3t")).as_deref(), Some("Basic YWJjOnMzY3IzdA=="));
         assert_eq!(basic_auth(&app("abc", "")), None);
+    }
+
+    #[test]
+    fn reports_missing_scopes() {
+        let token = |scope: &str| OAuthToken {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: Instant::now(),
+            scope: scope.into(),
+        };
+        assert_eq!(
+            token("user-read-private user-library-read").missing_scopes(OFFICIAL_ENGINE_SCOPES),
+            vec!["streaming", "user-read-email", "user-modify-playback-state"]
+        );
+        assert!(token(&WEB_API_SCOPES.join(" ")).missing_scopes(OFFICIAL_ENGINE_SCOPES).is_empty());
+        // Unknown grant: assume it is fine and let Spotify say otherwise.
+        assert!(token("").missing_scopes(OFFICIAL_ENGINE_SCOPES).is_empty());
     }
 
     #[test]

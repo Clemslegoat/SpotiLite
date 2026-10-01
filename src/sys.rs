@@ -44,6 +44,42 @@ pub fn memory() -> Memory {
     }
 }
 
+/// Private working set of another process (the WebView2 processes of the official
+/// engine), 0 if it cannot be read.
+#[cfg(windows)]
+pub fn process_memory(pid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: the handle is checked and closed; the structure is correctly sized.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return 0;
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
+            ..Default::default()
+        };
+        let ok = K32GetProcessMemoryInfo(
+            process,
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX2).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        );
+        CloseHandle(process);
+        if ok == 0 {
+            0
+        } else if counters.PrivateWorkingSetSize > 0 {
+            counters.PrivateWorkingSetSize as u64
+        } else {
+            counters.PrivateUsage as u64
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub fn memory() -> Memory {
     // /proc/self/statm: size resident shared text lib data dt (in pages)

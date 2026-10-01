@@ -21,6 +21,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --locked
+      - name: Official engine (WebView2 + Spotify SDK, informative)
+        continue-on-error: true
+        run: cargo test --locked -- --ignored --nocapture
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build (release)

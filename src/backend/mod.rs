@@ -5,6 +5,7 @@
 //! never blocks.
 
 mod auth;
+mod official;
 mod store;
 mod vault;
 mod webapi;
@@ -29,11 +30,12 @@ use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::config::{Paths, Quality, Settings};
+use crate::config::{Engine, Paths, Quality, Settings};
 use crate::model::{AlbumSummary, ArtistRef, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
 use crate::queue::Queue;
 pub use auth::AppCredentials;
 use auth::{AuthFlow, OAuthToken};
+use official::{EngineCommand, EngineEvent, ErrorKind, PlayerState, Progress, Tracker};
 use store::Store;
 use webapi::{ApiError, WebApi};
 
@@ -96,6 +98,8 @@ pub struct AppStatus {
     pub state: AppState,
     pub client_id: String,
     pub has_secret: bool,
+    /// The authorization predates the official engine: it lacks the playback scopes.
+    pub needs_playback_auth: bool,
 }
 
 /// Notifications for the interface.
@@ -169,6 +173,10 @@ pub enum Event {
         api_bytes: u64,
         audio_bytes: u64,
     },
+    /// What the official engine is doing, for the settings page.
+    EngineStatus(String),
+    /// Memory of the official engine's WebView2 processes (0 when stopped).
+    EngineMemory(u64),
 }
 
 /// Event sender that also wakes the UI up.
@@ -243,6 +251,14 @@ enum Internal {
     /// Delayed move to the next track after an unavailable one (carries the load
     /// generation so that any newer user action cancels it).
     SkipAfterUnavailable(u64),
+    /// Event of the official engine instance `.0`.
+    Official(u64, EngineEvent),
+    /// Starting a track on the official engine failed (load generation, error).
+    OfficialPlayFailed(u64, ApiError),
+    /// Playback scopes missing from the authorization (`.1`: the user just chose
+    /// the official engine, so the browser may be opened).
+    OfficialScopes(Vec<&'static str>, bool),
+    OfficialTokenFailed(String),
 }
 
 struct Audio {
@@ -293,6 +309,8 @@ fn next_quality(quality: Quality) -> Option<Quality> {
 
 /// Consecutive refused tracks before concluding the whole account is refused.
 const MAX_REFUSED_IN_A_ROW: u32 = 10;
+/// Bitrate assumed for the official engine when its traffic cannot be measured.
+const OFFICIAL_KBPS: u64 = 128;
 const REFUSED_TTL_SECS: u64 = 14 * 24 * 3600;
 
 fn now_secs() -> u64 {
@@ -349,6 +367,24 @@ struct Core {
     refreshed: HashMap<ViewKey, Instant>,
     searches: VecDeque<SearchResults>,
     audio_failed: bool,
+    /// Spotify's own player in WebView2, started on demand ("moteur officiel").
+    official: Option<official::Engine>,
+    /// Instance number, so that events of a stopped engine are ignored.
+    official_id: u64,
+    /// Spotify device id of the official engine, once registered.
+    device_id: Option<String>,
+    /// Track waiting for the official engine to be ready (load generation, id, position).
+    official_pending: Option<(u64, String, u32)>,
+    tracker: Tracker,
+    official_bytes: u64,
+    official_listened_ms: u64,
+    /// Load generation for which a stalled start was already reported.
+    official_stalled: u64,
+    /// The authorization lacks the scopes of the official engine.
+    needs_playback_auth: bool,
+    /// The browser was already opened once for those scopes in this session.
+    playback_auth_asked: bool,
+    drm: String,
 }
 
 impl Core {
@@ -404,6 +440,17 @@ impl Core {
             refreshed: HashMap::new(),
             searches: VecDeque::new(),
             audio_failed: false,
+            official: None,
+            official_id: 0,
+            device_id: None,
+            official_pending: None,
+            tracker: Tracker::default(),
+            official_bytes: 0,
+            official_listened_ms: 0,
+            official_stalled: 0,
+            needs_playback_auth: false,
+            playback_auth_asked: false,
+            drm: String::new(),
             paths,
             settings,
         }
@@ -444,8 +491,7 @@ impl Core {
         let now = now_secs();
         self.refused = self.store.load::<HashMap<String, u64>>("refused").unwrap_or_default();
         self.refused.retain(|_, at| now.saturating_sub(*at) < REFUSED_TTL_SECS);
-        self.queue.set_blocked(self.refused.keys().cloned().collect());
-        self.ui.send(Event::Refused(self.refused.keys().cloned().collect()));
+        self.sync_blocked();
         // Version 0.1 kept the client id in the settings: move it to the vault.
         if self.api.saved_app().is_none() && !self.settings.legacy_client_id.is_empty() {
             self.api.save_app(&AppCredentials {
@@ -459,6 +505,9 @@ impl Core {
         self.send_app_status();
         if self.app_connected {
             self.load_playlists();
+            if self.official_mode() {
+                self.check_playback_scopes(false);
+            }
         }
         match self.librespot_cache().and_then(|c| c.credentials()) {
             Some(credentials) => self.connect(credentials, false),
@@ -470,6 +519,7 @@ impl Core {
         for cancel in [&self.login_cancel, &self.app_login].into_iter().flatten() {
             cancel.store(true, Ordering::Relaxed);
         }
+        self.official = None;
         if let Some(audio) = self.audio.take() {
             audio.player.stop();
             drop(audio);
@@ -615,7 +665,9 @@ impl Core {
 
     fn send_app_status(&self) {
         let saved = self.api.saved_app();
-        let state = if self.app_login.is_some() {
+        // Authorizing again an application that works (playback scopes) keeps the
+        // interface usable: only a first authorization shows the setup screen.
+        let state = if self.app_login.is_some() && !self.app_connected {
             AppState::Authorizing
         } else if self.app_connected {
             AppState::Connected
@@ -628,6 +680,7 @@ impl Core {
             state,
             has_secret: saved.as_ref().is_some_and(|a| !a.client_secret.is_empty()),
             client_id: saved.map(|a| a.client_id).unwrap_or_default(),
+            needs_playback_auth: self.needs_playback_auth && state == AppState::Connected,
         }));
     }
 
@@ -651,6 +704,7 @@ impl Core {
             audio.player.stop();
             tokio::task::spawn_blocking(move || drop(audio));
         }
+        self.stop_official();
         if let Some(session) = self.session.take() {
             session.shutdown();
         }
@@ -700,7 +754,12 @@ impl Core {
                 self.start_app_login(app);
             }
             Command::ReconnectApp => match self.api.saved_app() {
-                Some(app) => self.start_app_login(app),
+                Some(app) => {
+                    if self.app_connected {
+                        self.ui.send(Event::Info("Acceptez l'autorisation dans le navigateur.".into()));
+                    }
+                    self.start_app_login(app);
+                }
                 None => self.send_app_status(),
             },
             Command::CancelAppLogin => {
@@ -727,16 +786,14 @@ impl Core {
             Command::PlayPause => self.play_pause(),
             Command::Next => self.skip(false),
             Command::Previous => self.previous(),
-            Command::Seek(ms) => {
-                if let Some(audio) = &self.audio {
-                    audio.player.seek(ms);
-                    self.set_position(ms);
-                }
-            }
+            Command::Seek(ms) => self.seek_to(ms),
             Command::SetVolume(volume) => {
                 self.settings.volume = volume;
                 if let Some(audio) = &self.audio {
                     audio.mixer.set_volume(volume_to_u16(volume));
+                }
+                if let Some(engine) = &self.official {
+                    engine.send(EngineCommand::Volume(volume));
                 }
             }
             Command::SetShuffle(on) => {
@@ -809,12 +866,20 @@ impl Core {
                 self.app_login = None;
                 match result {
                     Ok((app, token)) => {
+                        let missing = token.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES);
+                        let resume = self.needs_playback_auth && missing.is_empty() && self.official_mode();
+                        self.needs_playback_auth = !missing.is_empty();
                         self.api.connect(app, token).await;
                         self.app_connected = true;
                         self.refreshed.clear();
                         self.ui.send(Event::Info("Application Spotify connectée.".into()));
                         self.load_playlists();
                         self.fetch_display_name();
+                        if resume && let Some(track) = self.queue.current().cloned() {
+                            // The play that needed the new authorization.
+                            let position = self.position_ms;
+                            self.load(track, true, position);
+                        }
                     }
                     Err(e) => self.ui.error(app_error_hint(&e)),
                 }
@@ -824,6 +889,30 @@ impl Core {
                 if generation == self.load_generation {
                     self.skip(false);
                 }
+            }
+            Internal::Official(id, event) => {
+                if id == self.official_id && self.official.is_some() {
+                    self.on_official(event);
+                }
+            }
+            Internal::OfficialPlayFailed(generation, error) => {
+                if generation == self.load_generation {
+                    self.on_official_play_failed(error);
+                }
+            }
+            Internal::OfficialScopes(missing, interactive) => {
+                if missing.is_empty() {
+                    if self.needs_playback_auth {
+                        self.needs_playback_auth = false;
+                        self.send_app_status();
+                    }
+                } else {
+                    log::info!("authorization lacks {missing:?} for the official engine");
+                    self.ask_playback_auth(interactive);
+                }
+            }
+            Internal::OfficialTokenFailed(e) => {
+                self.ui.error(format!("Moteur officiel : jeton d'accès indisponible ({e})."));
             }
             Internal::LikedIds(ids) => self.liked_ids = Some(ids),
             Internal::Playlists(list) => {
@@ -871,13 +960,39 @@ impl Core {
             );
             self.send_playback(false);
         }
+        if self.official_mode() && self.official.is_some() {
+            if self.tracker.overdue(Instant::now()) {
+                log::info!("official engine: end of track not reported");
+                self.flush_listened();
+                self.playing = false;
+                self.skip(true);
+            } else if self.loaded
+                && !self.tracker.started()
+                && self.load_started.elapsed() > Duration::from_secs(25)
+                && self.official_stalled != self.load_generation
+            {
+                self.official_stalled = self.load_generation;
+                self.loaded = false;
+                self.ui.error(
+                    "Le moteur officiel ne démarre pas la lecture. Réessayez ; si cela persiste, \
+                     repassez au moteur SpotiLite (Réglages → Lecture).",
+                );
+                self.send_playback(false);
+            }
+        }
         self.send_usage();
     }
 
     fn send_usage(&mut self) {
-        let listened =
-            self.listened_ms + if self.playing { self.position_at.elapsed().as_millis() as u64 } else { 0 };
-        let audio = self.audio_bytes + listened * u64::from(self.quality.kbps()) / 8;
+        let current = if self.playing { self.position_at.elapsed().as_millis() as u64 } else { 0 };
+        let (native_ms, official_ms) = if self.official_mode() {
+            (self.listened_ms, self.official_listened_ms + current)
+        } else {
+            (self.listened_ms + current, self.official_listened_ms)
+        };
+        // What WebView2 reports, or an estimate if its audio requests are not seen.
+        let official = self.official_bytes.max(official_ms * OFFICIAL_KBPS / 8);
+        let audio = self.audio_bytes + native_ms * u64::from(self.quality.kbps()) / 8 + official;
         let api = self.api_bytes.load(Ordering::Relaxed);
         if (api, audio) != self.last_usage {
             self.last_usage = (api, audio);
@@ -890,8 +1005,17 @@ impl Core {
             // Refusals may depend on the file format: give every track a new chance.
             self.clear_refused();
         }
+        let engine_changed = new.engine != self.settings.engine;
+        let (position, playing) = (self.current_position(), self.playing);
+        if engine_changed {
+            // Counted for the engine that played it.
+            self.flush_listened();
+        }
         self.settings = new;
         self.quality = self.settings.quality;
+        if engine_changed {
+            return self.switch_engine(position, playing);
+        }
         let audio_changed = self
             .audio
             .as_ref()
@@ -980,6 +1104,9 @@ impl Core {
         self.position_ms = position_ms;
         self.position_at = Instant::now();
         self.playing = false;
+        if self.official_mode() {
+            return self.load_official(track, play, position_ms);
+        }
         if self.reconnect_if_needed() {
             self.pending_play = play;
             self.send_playback(true);
@@ -1002,6 +1129,9 @@ impl Core {
 
     fn play_pause(&mut self) {
         let Some(track) = self.queue.current().cloned() else { return };
+        if self.official_mode() {
+            return self.official_play_pause(track);
+        }
         if self.playing {
             if let Some(audio) = &self.audio {
                 audio.player.pause();
@@ -1027,6 +1157,10 @@ impl Core {
                 if let Some(audio) = &self.audio {
                     audio.player.stop();
                 }
+                if let Some(engine) = &self.official {
+                    engine.send(EngineCommand::Pause);
+                }
+                self.tracker.clear();
                 self.loaded = false;
                 self.flush_listened();
                 self.playing = false;
@@ -1038,21 +1172,26 @@ impl Core {
 
     fn previous(&mut self) {
         if self.current_position() > 3000 {
-            if let Some(audio) = &self.audio {
-                audio.player.seek(0);
-            }
-            self.set_position(0);
-            return;
+            return self.seek_to(0);
         }
         match self.queue.back() {
             Some(track) => self.load(track, true, 0),
-            None => {
-                if let Some(audio) = &self.audio {
-                    audio.player.seek(0);
-                }
-                self.set_position(0);
-            }
+            None => self.seek_to(0),
         }
+    }
+
+    fn seek_to(&mut self, ms: u32) {
+        if self.official_mode() {
+            if self.loaded
+                && let Some(engine) = &self.official
+            {
+                engine.send(EngineCommand::Seek(ms));
+                self.tracker.seeked(ms, Instant::now());
+            }
+        } else if let Some(audio) = &self.audio {
+            audio.player.seek(ms);
+        }
+        self.set_position(ms);
     }
 
     fn current_position(&self) -> u32 {
@@ -1072,7 +1211,12 @@ impl Core {
 
     fn flush_listened(&mut self) {
         if self.playing {
-            self.listened_ms += self.position_at.elapsed().as_millis() as u64;
+            let elapsed = self.position_at.elapsed().as_millis() as u64;
+            if self.official_mode() {
+                self.official_listened_ms += elapsed;
+            } else {
+                self.listened_ms += elapsed;
+            }
             self.position_at = Instant::now();
         }
     }
@@ -1145,8 +1289,8 @@ impl Core {
                 self.ui.send(Event::Notice {
                     key: "refused",
                     text: format!(
-                        "Lecture arrêtée : Spotify a refusé les {MAX_REFUSED_IN_A_ROW} derniers titres. \
-                         Si aucun titre ne passe, le refus concerne sans doute tout le compte : réessayez plus tard."
+                        "Lecture arrêtée : Spotify a refusé les {MAX_REFUSED_IN_A_ROW} derniers titres à librespot. \
+                         Le moteur officiel (Réglages → Lecture) les lit avec le DRM de Windows."
                     ),
                     error: true,
                 });
@@ -1157,10 +1301,12 @@ impl Core {
             self.ui.send(Event::Notice {
                 key: "refused",
                 text: format!(
-                    "{count} titre{} ignoré{} : Spotify refuse {} clé de déchiffrement (code 0x0001), dans toutes les qualités.",
+                    "{count} titre{} ignoré{} : Spotify refuse {} clé de déchiffrement à librespot (code 0x0001). \
+                     Le moteur officiel (Réglages → Lecture) peut {} lire.",
                     if count > 1 { "s" } else { "" },
                     if count > 1 { "s" } else { "" },
                     if count > 1 { "leur" } else { "sa" },
+                    if count > 1 { "les" } else { "le" },
                 ),
                 error: false,
             });
@@ -1220,6 +1366,378 @@ impl Core {
         self.store.save("refused", &self.refused);
         self.queue.block(id.clone());
         self.ui.send(Event::TrackRefused(id));
+    }
+
+    // ----------------------------------------------------------------------
+    // Official engine (Spotify's Web Playback SDK in WebView2)
+
+    fn official_mode(&self) -> bool {
+        self.settings.engine == Engine::Official
+    }
+
+    /// Refused tracks are only skipped (and greyed out) with librespot: the
+    /// official engine plays them.
+    fn sync_blocked(&mut self) {
+        let ids: HashSet<String> =
+            if self.official_mode() { HashSet::new() } else { self.refused.keys().cloned().collect() };
+        self.queue.set_blocked(ids.clone());
+        self.ui.send(Event::Refused(ids));
+    }
+
+    fn switch_engine(&mut self, position: u32, playing: bool) {
+        log::info!("playback engine: {:?}", self.settings.engine);
+        self.playing = false;
+        self.loaded = false;
+        self.sync_blocked();
+        if self.official_mode() {
+            if let Some(audio) = self.audio.take() {
+                audio.player.stop();
+                tokio::task::spawn_blocking(move || drop(audio));
+            }
+            self.check_playback_scopes(true);
+            // Started right away: it is ready by the time a track is chosen.
+            self.ensure_official();
+        } else {
+            self.stop_official();
+            self.ui.send(Event::EngineStatus("Arrêté".into()));
+        }
+        match self.queue.current().cloned() {
+            Some(track) => self.load(track, playing, position),
+            None => self.send_playback(false),
+        }
+    }
+
+    /// Checks that the authorization allows the official engine to play.
+    fn check_playback_scopes(&self, interactive: bool) {
+        if !self.app_connected {
+            return;
+        }
+        let (api, internal) = (self.api.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            if let Ok(missing) = api.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES).await {
+                let _ = internal.send(Internal::OfficialScopes(missing, interactive));
+            }
+        });
+    }
+
+    /// The authorization of the user's application predates the official engine:
+    /// it must be accepted again with the playback scopes.
+    fn ask_playback_auth(&mut self, open_browser: bool) {
+        self.needs_playback_auth = true;
+        let app = self.api.saved_app();
+        if open_browser
+            && !self.playback_auth_asked
+            && self.app_login.is_none()
+            && let Some(app) = app
+        {
+            self.playback_auth_asked = true;
+            self.ui.send(Event::Notice {
+                key: "engine",
+                text:
+                    "Le moteur officiel a besoin de l'autorisation de lecture de votre application Spotify : \
+                       acceptez-la dans le navigateur qui vient de s'ouvrir."
+                        .into(),
+                error: false,
+            });
+            return self.start_app_login(app);
+        }
+        self.send_app_status();
+        self.ui.send(Event::Notice {
+            key: "engine",
+            text: "Moteur officiel : autorisez la lecture dans Réglages → Application Spotify → « Autoriser la lecture ». \
+                   Si Spotify refuse encore, cochez « Web Playback SDK » dans les réglages de votre application \
+                   (tableau de bord Spotify → Settings → Edit)."
+                .into(),
+            error: true,
+        });
+    }
+
+    fn ensure_official(&mut self) -> bool {
+        if self.official.is_some() {
+            return true;
+        }
+        if !self.app_connected {
+            self.ui.error(
+                "Le moteur officiel lit avec votre application Spotify : connectez-la d'abord \
+                 (Réglages → Application Spotify).",
+            );
+            return false;
+        }
+        self.official_id += 1;
+        let (id, internal) = (self.official_id, self.internal.clone());
+        log::info!("starting the official engine");
+        self.device_id = None;
+        self.drm.clear();
+        self.ui.send(Event::EngineStatus("Démarrage…".into()));
+        self.official =
+            Some(official::Engine::start(self.paths.webview(), self.settings.volume, move |event| {
+                let _ = internal.send(Internal::Official(id, event));
+            }));
+        true
+    }
+
+    fn stop_official(&mut self) {
+        if self.official.take().is_some() {
+            log::info!("official engine stopped");
+            self.ui.send(Event::EngineMemory(0));
+        }
+        self.device_id = None;
+        self.official_pending = None;
+        self.tracker.clear();
+    }
+
+    fn load_official(&mut self, track: Track, play: bool, position_ms: u32) {
+        self.tracker.clear();
+        self.official_pending = None;
+        self.loaded = false;
+        self.send_queue();
+        self.refresh_liked_state(&track);
+        if !play || !self.ensure_official() {
+            if let Some(engine) = &self.official {
+                engine.send(EngineCommand::Pause);
+            }
+            return self.send_playback(false);
+        }
+        self.tracker.expect(track.id.clone(), track.duration_ms);
+        self.loaded = true;
+        self.send_playback(true);
+        self.official_play(self.load_generation, track.id, position_ms);
+    }
+
+    /// Asks Spotify to play the track on the official engine (one Web API call).
+    fn official_play(&mut self, generation: u64, track_id: String, position_ms: u32) {
+        let Some(device) = self.device_id.clone() else {
+            // Started when the engine announces itself.
+            self.official_pending = Some((generation, track_id, position_ms));
+            return;
+        };
+        let (api, internal) = (self.api.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            let mut attempt = 0;
+            let result = loop {
+                match api.play_on_device(&device, &track_id, position_ms).await {
+                    // Spotify's servers learn about a new device a moment after it is ready.
+                    Err(ApiError::NotFound) if attempt < 3 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                    }
+                    other => break other,
+                }
+            };
+            if let Err(e) = result {
+                let _ = internal.send(Internal::OfficialPlayFailed(generation, e));
+            }
+        });
+    }
+
+    fn official_play_pause(&mut self, track: Track) {
+        if self.playing {
+            if let Some(engine) = &self.official {
+                engine.send(EngineCommand::Pause);
+            }
+            let position = self.current_position();
+            self.flush_listened();
+            self.playing = false;
+            self.position_ms = position;
+            self.position_at = Instant::now();
+            self.tracker.paused(Instant::now());
+            self.send_playback(false);
+        } else if self.loaded && self.tracker.started() && self.device_id.is_some() {
+            if let Some(engine) = &self.official {
+                engine.send(EngineCommand::Resume);
+            }
+        } else {
+            let position = self.position_ms;
+            self.load(track, true, position);
+        }
+    }
+
+    fn on_official(&mut self, event: EngineEvent) {
+        match event {
+            EngineEvent::Ready(device) => {
+                log::info!("official engine ready");
+                self.device_id = Some(device);
+                self.send_engine_status();
+                if let Some((generation, track_id, position)) = self.official_pending.take()
+                    && generation == self.load_generation
+                {
+                    self.official_play(generation, track_id, position);
+                }
+            }
+            EngineEvent::NotReady => {
+                self.device_id = None;
+                self.ui.send(Event::EngineStatus("Reconnexion à Spotify…".into()));
+            }
+            EngineEvent::NeedToken => {
+                let Some(sender) = self.official.as_ref().map(official::Engine::sender) else { return };
+                let (api, internal) = (self.api.clone(), self.internal.clone());
+                tokio::spawn(async move {
+                    match api.access_token().await {
+                        Ok(token) => sender.send(EngineCommand::Token(token)),
+                        Err(e) => {
+                            let _ = internal.send(Internal::OfficialTokenFailed(e.to_string()));
+                        }
+                    }
+                });
+            }
+            EngineEvent::State(Some(state)) => match self.tracker.on_state(&state, Instant::now()) {
+                Progress::Ignore => {}
+                Progress::Started => {
+                    self.unavailable_streak = 0;
+                    self.official_progress(&state);
+                }
+                Progress::Update => self.official_progress(&state),
+                Progress::Ended => {
+                    self.flush_listened();
+                    self.playing = false;
+                    self.skip(true);
+                }
+            },
+            EngineEvent::State(None) => {
+                // Playback moved to another device (phone, other computer…).
+                if self.tracker.started() {
+                    let position = self.current_position();
+                    self.flush_listened();
+                    self.playing = false;
+                    self.loaded = false;
+                    self.position_ms = position;
+                    self.position_at = Instant::now();
+                    self.tracker.clear();
+                    self.send_playback(false);
+                    self.ui.send(Event::Info("La lecture continue sur un autre appareil Spotify.".into()));
+                }
+            }
+            EngineEvent::Error(kind, message) => self.on_official_error(kind, message),
+            EngineEvent::Drm(systems) => {
+                log::info!("official engine DRM systems: {systems:?}");
+                self.drm = if systems.iter().any(|s| s.contains("playready")) {
+                    "PlayReady".into()
+                } else if systems.iter().any(|s| s.contains("widevine")) {
+                    "Widevine".into()
+                } else {
+                    String::new()
+                };
+                if systems.is_empty() {
+                    self.ui.error(
+                        "WebView2 ne propose aucun DRM (PlayReady) sur ce PC : le lecteur officiel risque de ne rien lire. \
+                         Mettez Windows et Microsoft Edge WebView2 à jour.",
+                    );
+                }
+                self.send_engine_status();
+            }
+            EngineEvent::Log(message) => log::info!("official engine: {message}"),
+            EngineEvent::Bytes(bytes) => self.official_bytes += bytes,
+            EngineEvent::Memory(bytes) => self.ui.send(Event::EngineMemory(bytes)),
+            EngineEvent::Failed(message) => {
+                self.stop_official();
+                self.playing = false;
+                self.loaded = false;
+                self.send_playback(false);
+                self.ui.error(format!("Moteur officiel : {message}"));
+                self.ui.send(Event::EngineStatus(format!("Arrêté : {message}")));
+            }
+        }
+    }
+
+    fn send_engine_status(&self) {
+        let mut text =
+            if self.device_id.is_some() { "Prêt".to_string() } else { "Démarrage…".to_string() };
+        if !self.drm.is_empty() {
+            text.push_str(&format!(" · DRM {}", self.drm));
+        }
+        self.ui.send(Event::EngineStatus(text));
+    }
+
+    fn official_progress(&mut self, state: &PlayerState) {
+        self.flush_listened();
+        self.playing = !state.paused && !state.loading;
+        self.position_ms = state.position_ms;
+        self.position_at = Instant::now();
+        self.send_playback(state.loading);
+    }
+
+    fn on_official_error(&mut self, kind: ErrorKind, message: String) {
+        log::warn!("official engine error {kind:?}: {message}");
+        let fatal = match kind {
+            ErrorKind::Playback => return self.official_track_failed(message),
+            ErrorKind::Authentication => {
+                self.stop_official();
+                self.ask_playback_auth(true);
+                true
+            }
+            ErrorKind::Account => {
+                self.ui.error(
+                    "Spotify refuse ce compte au lecteur officiel : un abonnement Premium est nécessaire.",
+                );
+                true
+            }
+            ErrorKind::Initialization => {
+                self.ui.error(format!(
+                    "Le lecteur officiel de Spotify ne peut pas démarrer dans WebView2 ({message}). \
+                     Mettez Windows et Microsoft Edge WebView2 à jour."
+                ));
+                true
+            }
+            ErrorKind::Load => {
+                self.ui.error("Lecteur officiel injoignable (sdk.scdn.co) : vérifiez la connexion Internet.");
+                true
+            }
+            ErrorKind::Autoplay => {
+                self.ui.error("WebView2 a bloqué le démarrage du son : relancez la lecture.");
+                false
+            }
+            ErrorKind::Other => {
+                self.ui.error(format!("Moteur officiel : {message}"));
+                false
+            }
+        };
+        if fatal {
+            self.stop_official();
+            self.ui.send(Event::EngineStatus("Arrêté (erreur)".into()));
+        }
+        self.playing = false;
+        self.loaded = false;
+        self.send_playback(false);
+    }
+
+    /// One track could not be played by the official engine.
+    fn official_track_failed(&mut self, message: String) {
+        self.playing = false;
+        self.loaded = false;
+        self.tracker.clear();
+        self.unavailable_streak += 1;
+        self.send_playback(false);
+        if self.unavailable_streak >= 3 {
+            self.unavailable_streak = 0;
+            return self.ui.error(format!(
+                "Plusieurs titres d'affilée impossibles à lire avec le moteur officiel ({message}) : lecture arrêtée."
+            ));
+        }
+        let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
+        self.ui.error(format!("« {name} » : lecture impossible ({message}). Titre suivant…"));
+        self.schedule_skip(Duration::from_millis(1500));
+    }
+
+    fn on_official_play_failed(&mut self, error: ApiError) {
+        log::warn!("official engine play request failed: {error}");
+        self.playing = false;
+        self.loaded = false;
+        self.tracker.clear();
+        self.send_playback(false);
+        if error.is_missing_scope() {
+            return self.ask_playback_auth(true);
+        }
+        match error {
+            ApiError::NotFound => {
+                // The device is unknown to Spotify: start a fresh engine next time.
+                self.stop_official();
+                self.ui.error("Spotify ne trouve pas le moteur officiel : relancez la lecture.");
+            }
+            ApiError::NotConnected => self.ui.error(
+                "Connectez votre application Spotify (Réglages → Application Spotify) pour utiliser le moteur officiel.",
+            ),
+            other => self.ui.error(format!("Lecture impossible : {other}")),
+        }
     }
 
     fn handle_player(&mut self, event: PlayerEvent) {

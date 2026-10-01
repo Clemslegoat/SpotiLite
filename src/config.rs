@@ -44,9 +44,21 @@ impl Quality {
     }
 }
 
+/// What plays the audio.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Engine {
+    /// librespot inside SpotiLite: lightest, bitrate choice, audio cache.
+    #[default]
+    Native,
+    /// Spotify's own Web Playback SDK in an invisible WebView2 (PlayReady DRM):
+    /// plays the tracks whose keys Spotify refuses to librespot, uses more memory.
+    Official,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub engine: Engine,
     pub quality: Quality,
     /// Download album covers (64 px thumbnails, cached on disk).
     pub show_covers: bool,
@@ -70,6 +82,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            engine: Engine::Native,
             quality: Quality::Eco,
             show_covers: true,
             audio_cache_mb: 1024,
@@ -198,6 +211,11 @@ impl Paths {
 
     pub fn tmp(&self) -> PathBuf {
         self.cache.join("tmp")
+    }
+
+    /// Profile of the official engine (WebView2).
+    pub fn webview(&self) -> PathBuf {
+        self.cache.join("webview")
     }
 }
 

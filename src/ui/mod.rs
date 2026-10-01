@@ -129,6 +129,9 @@ pub struct App {
     usage: (u64, u64),
     memory: sys::Memory,
     memory_at: Option<Instant>,
+    /// State of the official engine and memory of its WebView2 processes.
+    engine_status: String,
+    engine_memory: u64,
     media: MediaKeys,
     minimized: bool,
     /// Setup form.
@@ -165,7 +168,12 @@ impl App {
             palette,
             auth: Auth::Unknown,
             user: String::new(),
-            app_status: AppStatus { state: AppState::Unknown, client_id: String::new(), has_secret: false },
+            app_status: AppStatus {
+                state: AppState::Unknown,
+                client_id: String::new(),
+                has_secret: false,
+                needs_playback_auth: false,
+            },
             playlists: Vec::new(),
             view: ViewKey::Welcome,
             history: Vec::new(),
@@ -186,6 +194,8 @@ impl App {
             usage: (0, 0),
             memory: sys::memory(),
             memory_at: None,
+            engine_status: "Arrêté".into(),
+            engine_memory: 0,
             media,
             minimized: false,
             settings,
@@ -250,6 +260,11 @@ impl App {
             ViewKey::Liked,
             Page::Tracks { title: "Titres likés".into(), subtitle: String::new(), tracks: Arc::new(tracks) },
         );
+        if std::env::var_os("SPOTILITE_DEMO_OFFICIAL").is_some() {
+            self.settings.engine = crate::config::Engine::Official;
+            self.engine_status = "Prêt · DRM PlayReady".into();
+            self.engine_memory = 118 * 1024 * 1024;
+        }
         if let Ok(view) = std::env::var("SPOTILITE_DEMO_VIEW") {
             self.view = match view.as_str() {
                 "settings" => ViewKey::Settings,
@@ -417,6 +432,8 @@ impl App {
                 }
             }
             Event::DataUsage { api_bytes, audio_bytes } => self.usage = (api_bytes, audio_bytes),
+            Event::EngineStatus(text) => self.engine_status = text,
+            Event::EngineMemory(bytes) => self.engine_memory = bytes,
         }
     }
 

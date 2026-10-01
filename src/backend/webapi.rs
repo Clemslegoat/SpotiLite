@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::Method;
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, RETRY_AFTER};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -53,6 +53,19 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+impl ApiError {
+    /// The authorization lacks a scope (it was granted before SpotiLite asked for it).
+    pub fn is_missing_scope(&self) -> bool {
+        match self {
+            ApiError::Forbidden(m) | ApiError::Status(401 | 403, m) => {
+                let m = m.to_lowercase();
+                m.contains("scope") || m.contains("permissions missing")
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type ApiResult<T> = Result<T, ApiError>;
 
 /// The user's Spotify application and its current token.
@@ -65,6 +78,9 @@ struct Connection {
 struct StoredToken {
     client_id: String,
     refresh_token: String,
+    /// Granted scopes (absent in files written by version 0.1).
+    #[serde(default)]
+    scope: String,
 }
 
 /// Every Web API call goes through the application the user created on
@@ -107,6 +123,7 @@ impl WebApi {
             access_token: String::new(),
             refresh_token: Some(stored.refresh_token),
             expires_at: Instant::now(),
+            scope: stored.scope,
         };
         *connection = Some(Connection { app, token });
         true
@@ -134,7 +151,8 @@ impl WebApi {
 
     fn save_token(&self, app: &AppCredentials, token: &OAuthToken) {
         let Some(refresh_token) = token.refresh_token.clone() else { return };
-        let stored = StoredToken { client_id: app.client_id.clone(), refresh_token };
+        let stored =
+            StoredToken { client_id: app.client_id.clone(), refresh_token, scope: token.scope.clone() };
         if let Err(e) = vault::save(&self.paths.web_token_file(), &stored) {
             log::warn!("could not save web api token: {e}");
         }
@@ -148,7 +166,10 @@ impl WebApi {
         }
         let refresh = connection.token.refresh_token.clone().unwrap_or_default();
         match auth::refresh(&self.http, &connection.app, &refresh).await {
-            Ok(token) => {
+            Ok(mut token) => {
+                if token.scope.is_empty() {
+                    token.scope = std::mem::take(&mut connection.token.scope);
+                }
                 self.save_token(&connection.app, &token);
                 connection.token = token;
                 Ok(connection.token.access_token.clone())
@@ -165,6 +186,20 @@ impl WebApi {
         }
     }
 
+    /// A valid access token of the user's application (for the official engine).
+    pub async fn access_token(&self) -> ApiResult<String> {
+        self.token().await
+    }
+
+    /// Scopes of `wanted` the current authorization lacks (refreshes the token
+    /// first, which tells the granted scopes).
+    pub async fn missing_scopes(&self, wanted: &[&'static str]) -> ApiResult<Vec<&'static str>> {
+        self.token().await?;
+        let guard = self.connection.lock().await;
+        let connection = guard.as_ref().ok_or(ApiError::NotConnected)?;
+        Ok(connection.token.missing_scopes(wanted))
+    }
+
     async fn invalidate_token(&self) {
         if let Some(connection) = self.connection.lock().await.as_mut() {
             connection.token.expires_at = Instant::now();
@@ -172,13 +207,19 @@ impl WebApi {
     }
 
     async fn request(&self, method: Method, url: &str) -> ApiResult<Vec<u8>> {
+        self.request_with(method, url, None).await
+    }
+
+    async fn request_with(&self, method: Method, url: &str, json: Option<&Value>) -> ApiResult<Vec<u8>> {
         let mut auth_retried = false;
         let mut retried = false;
         loop {
             let token = self.token().await?;
             let mut req =
                 self.http.request(method.clone(), url).bearer_auth(&token).header(ACCEPT_ENCODING, "gzip");
-            if method != Method::GET {
+            if let Some(json) = json {
+                req = req.header(CONTENT_TYPE, "application/json").body(json.to_string());
+            } else if method != Method::GET {
                 req = req.header(CONTENT_LENGTH, "0");
             }
             let resp = match req.send().await {
@@ -419,6 +460,16 @@ impl WebApi {
     }
 
     /// Downloads a cover image (public CDN, no token needed).
+    /// Starts a track on a Spotify device (the official engine), from `position_ms`.
+    pub async fn play_on_device(&self, device_id: &str, track_id: &str, position_ms: u32) -> ApiResult<()> {
+        let url =
+            reqwest::Url::parse_with_params(&format!("{API}/me/player/play"), &[("device_id", device_id)])
+                .map_err(|e| ApiError::Parse(e.to_string()))?;
+        let body =
+            serde_json::json!({ "uris": [format!("spotify:track:{track_id}")], "position_ms": position_ms });
+        self.request_with(Method::PUT, url.as_str(), Some(&body)).await.map(drop)
+    }
+
     pub async fn download(&self, url: &str) -> ApiResult<Vec<u8>> {
         let resp = self.http.get(url).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
         if !resp.status().is_success() {
@@ -633,9 +684,15 @@ mod tests {
             access_token: "access".into(),
             refresh_token: Some("refresh".into()),
             expires_at: Instant::now() + Duration::from_secs(600),
+            scope: "user-read-private streaming".into(),
         };
         api.connect(app.clone(), token).await;
+        assert_eq!(
+            api.missing_scopes(auth::OFFICIAL_ENGINE_SCOPES).await.unwrap(),
+            vec!["user-read-email", "user-modify-playback-state"]
+        );
         assert!(api.restore().await, "authorization survives a restart");
+        assert_eq!(api.connection.lock().await.as_ref().unwrap().token.scope, "user-read-private streaming");
 
         api.disconnect(false).await;
         assert!(!api.restore().await);

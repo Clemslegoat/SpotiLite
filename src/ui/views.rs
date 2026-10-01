@@ -11,7 +11,7 @@ use super::theme::{self, PLAYER_HEIGHT, ROW_HEIGHT, SIDEBAR_WIDTH};
 use super::widgets::{self, Icon, format_duration, format_total, paint_text};
 use super::{App, Auth, Page};
 use crate::backend::{AppCredentials, AppState, Command, human_bytes};
-use crate::config::Quality;
+use crate::config::{Engine, Quality};
 use crate::model::{AlbumSummary, PlaylistSummary, Repeat, Track, ViewKey};
 
 // ----------------------------------------------------------------------------
@@ -161,13 +161,19 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
         ui.label(RichText::new(data).font(small.clone()).color(p.faint)).on_hover_text(
             "Estimation pour cette session : interface et pochettes (mesuré) + audio (débit × durée écoutée).",
         );
-        let ram = format!(
-            "RAM {} · {} kbit/s",
-            human_bytes(app.memory.private_working_set),
-            app.settings.quality.kbps()
+        let ram = if app.settings.engine == Engine::Official {
+            format!(
+                "RAM {} + {} (moteur)",
+                human_bytes(app.memory.private_working_set),
+                human_bytes(app.engine_memory)
+            )
+        } else {
+            format!("RAM {} · {} kbit/s", human_bytes(app.memory.private_working_set), app.settings.quality.kbps())
+        };
+        ui.label(RichText::new(ram).font(small).color(p.faint)).on_hover_text(
+            "Mémoire utilisée, telle qu'affichée par le Gestionnaire des tâches (avec le moteur officiel : \
+             SpotiLite + processus WebView2) · qualité audio",
         );
-        ui.label(RichText::new(ram).font(small).color(p.faint))
-            .on_hover_text("Mémoire utilisée, telle qu'affichée par le Gestionnaire des tâches · qualité audio");
         ui.add_space(2.0);
         nav_item(app, ui, "Réglages", ViewKey::Settings);
     });
@@ -597,8 +603,9 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
         response.on_hover_cursor(if track.playable { CursorIcon::Default } else { CursorIcon::NotAllowed });
     if refused {
         response = response.on_hover_text(
-            "Spotify a refusé la clé de déchiffrement de ce titre (code 0x0001), dans toutes les \
-             qualités : il est sauté automatiquement. Double-cliquez pour réessayer.",
+            "Spotify a refusé à librespot la clé de déchiffrement de ce titre (code 0x0001), dans \
+             toutes les qualités : il est sauté automatiquement. Double-cliquez pour réessayer, ou \
+             choisissez le moteur officiel (Réglages → Lecture), qui le lit.",
         );
     }
     if link_clicked {
@@ -967,13 +974,25 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
             };
             ui.label(RichText::new(text).color(p.text));
             ui.label(
-                RichText::new("Elle sert à la bibliothèque et à la recherche ; la lecture audio passe par votre compte.")
+                RichText::new("Elle sert à la bibliothèque, à la recherche et, avec le moteur officiel, à la lecture.")
                     .small()
                     .color(p.faint),
             );
             ui.add_space(6.0);
+            if status.needs_playback_auth {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Le moteur officiel a besoin d'une autorisation de lecture que cette application n'a pas encore donnée.",
+                    )
+                    .color(p.text),
+                );
+            }
             ui.horizontal(|ui| {
                 if status.state == AppState::Disconnected && widgets::pill(ui, &p, "Reconnecter", true).clicked() {
+                    app.send(Command::ReconnectApp);
+                }
+                if status.needs_playback_auth && widgets::pill(ui, &p, "Autoriser la lecture", true).clicked() {
                     app.send(Command::ReconnectApp);
                 }
                 if widgets::pill(ui, &p, "Modifier les identifiants", false).clicked() {
@@ -1004,6 +1023,16 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
 
         card(ui, &p, "Économie de données", |ui| {
             ui.label(RichText::new("Qualité audio").color(p.text));
+            if app.settings.engine == Engine::Official {
+                ui.label(
+                    RichText::new(
+                        "Moteur officiel : c'est Spotify qui choisit le débit (AAC, en général 128 à 256 kbit/s) \
+                         et le cache audio n'est pas utilisé. Ces réglages s'appliquent au moteur SpotiLite.",
+                    )
+                    .small()
+                    .color(p.faint),
+                );
+            }
             for quality in Quality::ALL {
                 let text = format!(
                     "{} · {} kbit/s · ≈ {} Mo par heure",
@@ -1041,8 +1070,41 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
         });
 
         card(ui, &p, "Lecture", |ui| {
+            ui.label(RichText::new("Moteur de lecture").color(p.text));
             changed |= ui
-                .checkbox(&mut app.settings.normalisation, "Normaliser le volume entre les titres")
+                .radio_value(&mut app.settings.engine, Engine::Native, "SpotiLite (librespot) · le plus léger")
+                .changed();
+            ui.label(
+                RichText::new(
+                    "≈ 50 Mo de RAM, qualité 96 à 320 kbit/s, cache audio. Spotify refuse parfois ses clés de \
+                     déchiffrement à librespot : ces titres sont alors sautés.",
+                )
+                .small()
+                .color(p.faint),
+            );
+            ui.add_space(4.0);
+            changed |= ui
+                .radio_value(&mut app.settings.engine, Engine::Official, "Officiel Spotify (WebView2 + PlayReady)")
+                .changed();
+            ui.label(
+                RichText::new(
+                    "Le lecteur de Spotify lui-même, invisible, déchiffré par le DRM de Windows : lit les titres \
+                     refusés à librespot. Coûte ≈ 100 à 150 Mo de RAM en plus (processus Microsoft Edge WebView2), \
+                     sans choix de qualité ni cache audio. Interface, file d'attente et raccourcis restent ceux de SpotiLite.",
+                )
+                .small()
+                .color(p.faint),
+            );
+            if app.settings.engine == Engine::Official {
+                let mut state = format!("État : {}", app.engine_status);
+                if app.engine_memory > 0 {
+                    state.push_str(&format!(" · {} de RAM", human_bytes(app.engine_memory)));
+                }
+                ui.label(RichText::new(state).color(p.dim));
+            }
+            ui.add_space(8.0);
+            changed |= ui
+                .checkbox(&mut app.settings.normalisation, "Normaliser le volume entre les titres (moteur SpotiLite)")
                 .changed();
             let refused = app.refused.len();
             if refused > 0 {
@@ -1081,6 +1143,15 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
                 ))
                 .color(p.dim),
             );
+            if app.engine_memory > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "Moteur officiel (processus Microsoft Edge WebView2) : {} en plus.",
+                        human_bytes(app.engine_memory)
+                    ))
+                    .color(p.dim),
+                );
+            }
             changed |= ui
                 .checkbox(&mut app.settings.trim_when_minimized, "Libérer la mémoire quand la fenêtre est réduite")
                 .changed();
@@ -1225,8 +1296,10 @@ fn setup_guide(app: &mut App, ui: &mut Ui) {
         });
         step(ui, &p, 4, |ui| {
             ui.label(
-                RichText::new("Cochez « Web API », acceptez les conditions puis cliquez sur « Save ».")
-                    .color(p.text),
+                RichText::new(
+                    "Cochez « Web API » et « Web Playback SDK », acceptez les conditions puis cliquez sur « Save ».",
+                )
+                .color(p.text),
             );
         });
         step(ui, &p, 5, |ui| {
