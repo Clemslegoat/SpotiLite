@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::config::{Paths, Settings};
-use crate::model::{AlbumSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
+use crate::model::{AlbumSummary, ArtistSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
 use crate::queue::Queue;
 pub use auth::AppCredentials;
 use auth::{AuthFlow, OAuthToken};
@@ -132,6 +132,8 @@ pub enum Event {
         title: String,
         albums: Vec<AlbumSummary>,
     },
+    /// Artists the user follows.
+    FollowedArtists(Vec<ArtistSummary>),
     Artist {
         id: String,
         name: String,
@@ -570,7 +572,7 @@ impl Core {
         }
         let (api, internal) = (self.api.clone(), self.internal.clone());
         tokio::spawn(async move {
-            if let Ok(missing) = api.missing_scopes(auth::PLAYBACK_SCOPES).await {
+            if let Ok(missing) = api.missing_scopes(auth::REQUIRED_SCOPES).await {
                 let _ = internal.send(Internal::Scopes(missing, interactive));
             }
         });
@@ -589,8 +591,8 @@ impl Core {
             self.playback_auth_asked = true;
             self.ui.send(Event::Notice {
                 key: "auth",
-                text: "La lecture a besoin d'une autorisation de votre application Spotify : \
-                       acceptez-la dans le navigateur qui vient de s'ouvrir."
+                text: "SpotiLite a besoin d'une autorisation supplémentaire de votre application Spotify \
+                       (lecture, artistes suivis) : acceptez-la dans le navigateur qui vient de s'ouvrir."
                     .into(),
                 error: false,
             });
@@ -599,9 +601,8 @@ impl Core {
         self.send_app_status();
         self.ui.send(Event::Notice {
             key: "auth",
-            text: "Autorisez la lecture : Réglages → Application Spotify → « Autoriser la lecture ». \
-                   Si Spotify refuse encore, cochez « Web Playback SDK » dans les réglages de votre \
-                   application (tableau de bord Spotify → Settings → Edit)."
+            text: "Autorisation à renouveler : Réglages → « Autoriser ». Si Spotify refuse encore la \
+                   lecture, cochez « Web Playback SDK » dans votre application (tableau de bord Spotify)."
                 .into(),
             error: true,
         });
@@ -720,7 +721,7 @@ impl Core {
                 self.app_login = None;
                 match result {
                     Ok((app, token)) => {
-                        let missing = token.missing_scopes(auth::PLAYBACK_SCOPES);
+                        let missing = token.missing_scopes(auth::REQUIRED_SCOPES);
                         let resume = self.needs_playback_auth && missing.is_empty();
                         let first = !self.app_connected;
                         self.needs_playback_auth = !missing.is_empty();
@@ -1516,6 +1517,39 @@ impl Core {
                     }
                 });
             }
+            ViewKey::Artists => {
+                let cached = store.load::<Vec<ArtistSummary>>("artists");
+                if let Some(artists) = &cached {
+                    ui.send(Event::FollowedArtists(artists.clone()));
+                    if self.fresh(&view, Duration::from_secs(1800), force) {
+                        return;
+                    }
+                } else {
+                    self.fresh(&view, Duration::ZERO, true);
+                    ui.send(Event::Loading(view.clone()));
+                }
+                let internal = self.internal.clone();
+                tokio::spawn(async move {
+                    match api.followed_artists().await {
+                        Ok(artists) => {
+                            if cached.as_ref() != Some(&artists) {
+                                store.save("artists", &artists);
+                                ui.send(Event::FollowedArtists(artists));
+                            }
+                        }
+                        // Authorizations given before this page existed lack the scope.
+                        Err(e) if e.is_missing_scope() => {
+                            let _ = internal.send(Internal::Scopes(vec!["user-follow-read"], true));
+                            ui.send(Event::ViewFailed {
+                                view,
+                                message: "Autorisez SpotiLite à lire vos artistes suivis (le navigateur s'ouvre), puis réessayez."
+                                    .into(),
+                            });
+                        }
+                        Err(e) => ui.send(Event::ViewFailed { view, message: e.to_string() }),
+                    }
+                });
+            }
             ViewKey::Playlist(id) => {
                 let summary = self.playlists.get(&id).cloned();
                 let title = summary.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Playlist".into());
@@ -1647,6 +1681,7 @@ impl Core {
                 ViewKey::SavedAlbums => store
                     .load::<Vec<AlbumSummary>>("albums")
                     .map(|albums| Event::Albums { view: view.clone(), title: "Albums".into(), albums }),
+                ViewKey::Artists => store.load::<Vec<ArtistSummary>>("artists").map(Event::FollowedArtists),
                 ViewKey::Playlist(id) => store.load::<CachedTracks>(&format!("playlist-{id}")).map(|c| {
                     let summary = self.playlists.get(id);
                     Event::Tracks {

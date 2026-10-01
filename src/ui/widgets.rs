@@ -6,7 +6,7 @@ use std::f32::consts::PI;
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Margin, Pos2, Rect, Response, Sense, Shape,
-    Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    Stroke, Ui, Vec2, pos2, vec2,
 };
 
 use super::theme::{self, Palette};
@@ -28,39 +28,40 @@ pub enum Icon {
     Disc,
     Library,
     Settings,
+    Artist,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.5;
-    let stroke = Stroke::new((r * 0.16).clamp(1.4, 2.2), color);
+    let stroke = Stroke::new((r * 0.15).clamp(1.4, 2.8), color);
     match icon {
         Icon::Play => {
-            let pts = vec![
+            let pts = [
                 pos2(c.x - r * 0.32, c.y - r * 0.52),
                 pos2(c.x + r * 0.55, c.y),
                 pos2(c.x - r * 0.32, c.y + r * 0.52),
             ];
-            painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+            painter.add(Shape::convex_polygon(rounded(&pts, r * 0.12), color, Stroke::NONE));
         }
         Icon::Pause => {
             let w = r * 0.26;
             let h = r * 0.95;
             for dx in [-r * 0.28, r * 0.28] {
                 let bar = Rect::from_center_size(pos2(c.x + dx, c.y), vec2(w, h));
-                painter.rect_filled(bar, CornerRadius::same(2), color);
+                painter.rect_filled(bar, CornerRadius::same((w * 0.3) as u8), color);
             }
         }
         Icon::Next | Icon::Prev => {
             let dir = if icon == Icon::Next { 1.0 } else { -1.0 };
-            let pts = vec![
+            let pts = [
                 pos2(c.x - dir * r * 0.42, c.y - r * 0.45),
                 pos2(c.x + dir * r * 0.28, c.y),
                 pos2(c.x - dir * r * 0.42, c.y + r * 0.45),
             ];
-            painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+            painter.add(Shape::convex_polygon(rounded(&pts, r * 0.1), color, Stroke::NONE));
             let bar = Rect::from_center_size(pos2(c.x + dir * r * 0.42, c.y), vec2(r * 0.17, r * 0.9));
-            painter.rect_filled(bar, CornerRadius::same(2), color);
+            painter.rect_filled(bar, CornerRadius::same((r * 0.085) as u8), color);
         }
         Icon::Heart { filled } => {
             if filled {
@@ -148,18 +149,26 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             arrow_head(painter, pos2(rr + r * 0.08, bottom), vec2(1.0, 0.0), r * 0.26, color);
         }
         Icon::Repeat { one } => {
-            // A rounded loop with an arrowhead on its top edge.
-            let rect = Rect::from_center_size(c, vec2(r * 1.25, r * 0.85));
-            painter.rect_stroke(rect, CornerRadius::same((r * 0.3) as u8), stroke, StrokeKind::Middle);
-            arrow_head(
-                painter,
-                pos2(rect.center().x + r * 0.16, rect.top()),
-                vec2(1.0, 0.0),
-                r * 0.26,
-                color,
-            );
+            // A rounded loop in two halves, each ending with an arrowhead: top
+            // half going right, bottom half (the same, turned around) going left.
+            let (hw, hh, corner) = (r * 0.66, r * 0.42, r * 0.3);
+            let head = r * 0.24;
+            let half: Vec<Pos2> = [pos2(c.x - hw, c.y + hh * 0.35)]
+                .into_iter()
+                .chain((0..=8).map(|i| {
+                    let a = PI + PI * 0.5 * i as f32 / 8.0;
+                    pos2(c.x - hw + corner, c.y - hh + corner) + vec2(a.cos(), a.sin()) * corner
+                }))
+                .chain([pos2(c.x + hw * 0.45, c.y - hh)])
+                .collect();
+            for flip in [1.0, -1.0] {
+                let turn = |q: Pos2| c + (q - c) * flip;
+                painter.add(Shape::line(half.iter().copied().map(turn).collect(), stroke));
+                let tip = turn(pos2(c.x + hw * 0.45 + head * 0.9, c.y - hh));
+                arrow_head(painter, tip, vec2(flip, 0.0), head, color);
+            }
             if one {
-                painter.text(c, Align2::CENTER_CENTER, "1", FontId::proportional(r * 0.75), color);
+                painter.text(c, Align2::CENTER_CENTER, "1", FontId::proportional(r * 0.62), color);
             }
         }
         Icon::Search => {
@@ -183,6 +192,11 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 stroke,
             );
         }
+        Icon::Artist => {
+            // Head and shoulders.
+            painter.circle_stroke(pos2(c.x, c.y - r * 0.28), r * 0.3, stroke);
+            painter.add(arc(pos2(c.x, c.y + r * 0.78), r * 0.62, PI * 1.12, PI * 1.88, stroke));
+        }
         Icon::Settings => {
             // Two sliders.
             for (dy, knob) in [(-0.3, 0.25), (0.3, -0.25)] {
@@ -192,6 +206,26 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             }
         }
     }
+}
+
+/// The corners of a convex polygon rounded with quadratic curves (still convex).
+fn rounded(points: &[Pos2], radius: f32) -> Vec<Pos2> {
+    let n = points.len();
+    let mut out = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let (prev, v, next) = (points[(i + n - 1) % n], points[i], points[(i + 1) % n]);
+        let a = v + (prev - v).normalized() * radius.min((prev - v).length() * 0.5);
+        let b = v + (next - v).normalized() * radius.min((next - v).length() * 0.5);
+        for k in 0..=5 {
+            let t = k as f32 / 5.0;
+            let u = 1.0 - t;
+            out.push(pos2(
+                u * u * a.x + 2.0 * u * t * v.x + t * t * b.x,
+                u * u * a.y + 2.0 * u * t * v.y + t * t * b.y,
+            ));
+        }
+    }
+    out
 }
 
 fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, size: f32, color: Color32) {
@@ -226,8 +260,10 @@ fn heart_points(c: Pos2, size: f32) -> Vec<Pos2> {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ButtonStyle {
-    /// Transparent, a soft disc under the pointer.
+    /// Transparent, a soft disc under the pointer, grey icon (toggles).
     Plain,
+    /// Same, white icon (main controls).
+    Bright,
     /// White disc, black icon: the main action.
     Accent,
     /// Grey disc.
@@ -243,13 +279,29 @@ pub fn round_button(
     style: ButtonStyle,
     active: bool,
 ) -> Response {
+    let shrink = if style == ButtonStyle::Accent { 0.29 } else { 0.22 };
+    icon_button(ui, p, icon, size, size * (1.0 - 2.0 * shrink), style, active)
+}
+
+/// Round icon button whose icon is drawn in an `icon_size` square: large
+/// controls get large, detailed icons.
+pub fn icon_button(
+    ui: &mut Ui,
+    p: &Palette,
+    icon: Icon,
+    size: f32,
+    icon_size: f32,
+    style: ButtonStyle,
+    active: bool,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let hovered = response.hovered();
         let pressed = response.is_pointer_button_down_on();
-        let radius = size * 0.5 * if pressed { 0.94 } else { 1.0 };
+        let scale = if pressed { 0.94 } else { 1.0 };
+        let radius = size * 0.5 * scale;
         let color = match style {
             ButtonStyle::Accent => {
                 let fill = if hovered { p.accent_hover } else { p.accent };
@@ -260,18 +312,20 @@ pub fn round_button(
                 painter.circle_filled(rect.center(), radius, if hovered { p.line } else { p.raised });
                 p.text
             }
-            ButtonStyle::Plain => {
+            ButtonStyle::Plain | ButtonStyle::Bright => {
+                // Translucent: works on the plain surfaces and on the cover gradient.
                 if hovered {
-                    painter.circle_filled(rect.center(), radius, p.raised);
+                    painter.circle_filled(rect.center(), radius, Color32::from_white_alpha(26));
                 }
-                if active || hovered { p.text } else { p.dim }
+                if active || hovered || style == ButtonStyle::Bright { p.text } else { p.dim }
             }
         };
         let color = if active { p.accent } else { color };
-        let inner = rect.shrink(size * if style == ButtonStyle::Accent { 0.28 } else { 0.24 });
+        let inner = Rect::from_center_size(rect.center(), Vec2::splat(icon_size * scale));
         paint_icon(painter, inner, icon, color);
         if active {
-            painter.circle_filled(pos2(rect.center().x, rect.bottom() - 1.5), 1.8, p.accent);
+            let dot = (size * 0.045).clamp(1.8, 2.6);
+            painter.circle_filled(pos2(rect.center().x, rect.bottom() - dot), dot, p.accent);
         }
     }
     response
@@ -381,7 +435,8 @@ pub fn bar(ui: &mut Ui, p: &Palette, width: f32, value: f32, enabled: bool) -> (
     let active = enabled && (response.hovered() || response.dragged());
     let painter = ui.painter();
     let rail = Rect::from_center_size(rect.center(), vec2(rect.width(), if active { 6.0 } else { 4.0 }));
-    painter.rect_filled(rail, CornerRadius::same(3), p.line);
+    // Translucent rail: readable on any background, including the cover gradient.
+    painter.rect_filled(rail, CornerRadius::same(3), Color32::from_white_alpha(48));
     let mut filled = rail;
     filled.set_right(rail.left() + rail.width() * shown);
     painter.rect_filled(filled, CornerRadius::same(3), if active { p.accent } else { p.text });

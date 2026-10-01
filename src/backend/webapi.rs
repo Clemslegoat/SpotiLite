@@ -400,6 +400,38 @@ impl WebApi {
         Ok((artist.name, top, albums))
     }
 
+    /// Artists the user follows, sorted by name (cursor pagination).
+    pub async fn followed_artists(&self) -> ApiResult<Vec<ArtistSummary>> {
+        #[derive(Deserialize)]
+        struct Response {
+            artists: Cursor,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Cursor {
+            items: Vec<Value>,
+            next: Option<String>,
+        }
+        let mut artists = Vec::new();
+        let mut url = Some(format!("{API}/me/following?type=artist&limit=50"));
+        while let Some(current) = url.take() {
+            let page: Response = self.get(&current).await?;
+            artists.extend(
+                page.artists
+                    .items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<ArtistJson>(v).ok())
+                    .filter_map(artist_summary),
+            );
+            if artists.len() >= MAX_ITEMS {
+                break;
+            }
+            url = page.artists.next;
+        }
+        artists.sort_by_cached_key(|a| a.name.to_lowercase());
+        Ok(artists)
+    }
+
     pub async fn search(&self, query: &str) -> ApiResult<SearchResults> {
         #[derive(Deserialize, Default)]
         #[serde(default)]
@@ -430,7 +462,7 @@ impl WebApi {
                 .items
                 .into_iter()
                 .filter_map(|v| serde_json::from_value::<ArtistJson>(v).ok())
-                .filter_map(|a| Some(ArtistSummary { id: a.id?, name: a.name }))
+                .filter_map(artist_summary)
                 .collect(),
             playlists: r.playlists.items.into_iter().filter_map(playlist_from).collect(),
         })
@@ -594,6 +626,12 @@ struct ArtistJson {
     id: Option<String>,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    images: Vec<ImageJson>,
+}
+
+fn artist_summary(artist: ArtistJson) -> Option<ArtistSummary> {
+    Some(ArtistSummary { id: artist.id?, name: artist.name, image: small_image(&artist.images) })
 }
 
 #[derive(Deserialize)]
@@ -725,6 +763,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn artists_keep_a_small_image() {
+        let json = json!({"id": "a1", "name": "Nora", "images": [
+            {"url": "big", "width": 640}, {"url": "small", "width": 160}, {"url": "tiny", "width": 32}
+        ]});
+        let artist = artist_summary(serde_json::from_value(json).unwrap()).unwrap();
+        assert_eq!(artist.image.as_deref(), Some("small"));
+        assert!(artist_summary(serde_json::from_value(json!({"name": "no id"})).unwrap()).is_none());
+    }
+
+    #[test]
     fn player_urls_carry_the_device() {
         let url = player_url("queue", "dev 1", &[("uri", "spotify:track:abc")]).unwrap();
         assert_eq!(
@@ -756,8 +804,8 @@ mod tests {
         };
         api.connect(app.clone(), token).await;
         assert_eq!(
-            api.missing_scopes(auth::PLAYBACK_SCOPES).await.unwrap(),
-            vec!["user-read-email", "user-modify-playback-state"]
+            api.missing_scopes(auth::REQUIRED_SCOPES).await.unwrap(),
+            vec!["user-read-email", "user-modify-playback-state", "user-follow-read"]
         );
         assert!(api.restore().await, "authorization survives a restart");
         assert_eq!(api.connection.lock().await.as_ref().unwrap().token.scope, "user-read-private streaming");

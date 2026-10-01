@@ -29,12 +29,13 @@ pub const WEB_API_SCOPES: &[&str] = &[
     "user-read-email",
     "user-read-playback-state",
     "user-modify-playback-state",
+    "user-follow-read",
 ];
 
-/// Scopes without which the playback engine cannot play (authorizations given to
-/// version 0.1 lack them).
-pub const PLAYBACK_SCOPES: &[&str] =
-    &["streaming", "user-read-email", "user-read-private", "user-modify-playback-state"];
+/// Scopes added since version 0.1 (playback, followed artists): an older
+/// authorization lacking them is renewed once.
+pub const REQUIRED_SCOPES: &[&str] =
+    &["streaming", "user-read-email", "user-read-private", "user-modify-playback-state", "user-follow-read"];
 
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -368,12 +369,12 @@ mod tests {
             scope: scope.into(),
         };
         assert_eq!(
-            token("user-read-private user-library-read").missing_scopes(PLAYBACK_SCOPES),
-            vec!["streaming", "user-read-email", "user-modify-playback-state"]
+            token("user-read-private user-library-read").missing_scopes(REQUIRED_SCOPES),
+            vec!["streaming", "user-read-email", "user-modify-playback-state", "user-follow-read"]
         );
-        assert!(token(&WEB_API_SCOPES.join(" ")).missing_scopes(PLAYBACK_SCOPES).is_empty());
+        assert!(token(&WEB_API_SCOPES.join(" ")).missing_scopes(REQUIRED_SCOPES).is_empty());
         // Unknown grant: assume it is fine and let Spotify say otherwise.
-        assert!(token("").missing_scopes(PLAYBACK_SCOPES).is_empty());
+        assert!(token("").missing_scopes(REQUIRED_SCOPES).is_empty());
     }
 
     #[test]

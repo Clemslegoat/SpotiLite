@@ -68,6 +68,8 @@ pub struct AlbumSummary {
 pub struct ArtistSummary {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,8 @@ pub enum ViewKey {
     Welcome,
     Liked,
     SavedAlbums,
+    /// Artists the user follows.
+    Artists,
     Playlist(String),
     Album(String),
     Artist(String),

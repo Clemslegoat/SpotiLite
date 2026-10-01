@@ -13,7 +13,7 @@ use super::theme::{
 use super::widgets::{self, ButtonStyle, Icon, format_duration, format_total, paint_text};
 use super::{App, Page};
 use crate::backend::{AppCredentials, AppState, Command, human_bytes};
-use crate::model::{AlbumSummary, PlaylistSummary, Repeat, Track, ViewKey};
+use crate::model::{AlbumSummary, ArtistSummary, PlaylistSummary, Repeat, Track, ViewKey};
 
 fn surface(p: &theme::Palette, outer: Margin, inner: Margin) -> Frame {
     Frame::new()
@@ -64,7 +64,11 @@ pub fn main_layout(app: &mut App, ui: &mut Ui) {
         .exact_size(PLAYER_HEIGHT + f32::from(GAP))
         .resizable(false)
         .show_separator_line(false)
-        .frame(surface(&p, Margin { left: GAP, right: GAP, top: 0, bottom: GAP }, Margin::symmetric(18, 8)))
+        .frame(surface(
+            &p,
+            Margin { left: GAP, right: GAP, top: 0, bottom: GAP },
+            Margin::symmetric(PLAYER_MARGIN_X, PLAYER_MARGIN_Y),
+        ))
         .show(ui, |ui| player_bar(app, ui));
     egui::Panel::left("sidebar")
         .exact_size(SIDEBAR_WIDTH)
@@ -118,6 +122,7 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
 
     nav_item(app, ui, Icon::Heart { filled: true }, "Titres likés", ViewKey::Liked, None);
     nav_item(app, ui, Icon::Disc, "Albums", ViewKey::SavedAlbums, None);
+    nav_item(app, ui, Icon::Artist, "Artistes", ViewKey::Artists, None);
     let count = app.player.upcoming.len();
     let badge = (count > 0).then(|| count.min(99).to_string());
     nav_item(app, ui, Icon::Queue, "File d'attente", ViewKey::Queue, badge);
@@ -253,6 +258,17 @@ fn content(app: &mut App, ui: &mut Ui) {
         return;
     }
     match app.pages.get(&view) {
+        Some(Page::Artists(artists)) => {
+            let artists = artists.clone();
+            let count = match artists.len() {
+                0 => "Aucun artiste suivi".to_string(),
+                1 => "1 artiste suivi".to_string(),
+                n => format!("{n} artistes suivis"),
+            };
+            header(app, ui, "Artistes", &count, Some(&ViewKey::Artists));
+            ui.add_space(12.0);
+            artist_list(app, ui, &artists);
+        }
         Some(Page::Tracks { title, subtitle, tracks }) => {
             let (title, subtitle, tracks) = (title.clone(), subtitle.clone(), tracks.clone());
             tracks_page(app, ui, &title, &subtitle, tracks);
@@ -287,6 +303,7 @@ fn welcome_page(app: &mut App, ui: &mut Ui) {
     let mut shortcuts: Vec<(Icon, String, ViewKey)> = vec![
         (Icon::Heart { filled: true }, "Titres likés".into(), ViewKey::Liked),
         (Icon::Disc, "Albums".into(), ViewKey::SavedAlbums),
+        (Icon::Artist, "Artistes".into(), ViewKey::Artists),
     ];
     shortcuts.extend(
         app.playlists
@@ -818,6 +835,53 @@ fn album_row(app: &mut App, ui: &mut Ui, album: &AlbumSummary) {
     }
 }
 
+fn artist_list(app: &mut App, ui: &mut Ui, artists: &[ArtistSummary]) {
+    let artists = artists.to_vec();
+    ScrollArea::vertical().id_salt("artists").auto_shrink([false, false]).show_rows(
+        ui,
+        58.0,
+        artists.len(),
+        |ui, range| {
+            for artist in &artists[range] {
+                artist_row(app, ui, artist);
+            }
+        },
+    );
+}
+
+fn artist_row(app: &mut App, ui: &mut Ui, artist: &ArtistSummary) {
+    let p = app.palette;
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if response.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_ROW), p.hover);
+    }
+    // Round portrait, as artists are shown everywhere.
+    let art = Rect::from_min_size(rect.min + vec2(8.0, 7.0), vec2(44.0, 44.0));
+    let texture = if app.settings.show_covers { app.cover(artist.image.as_ref()) } else { None };
+    match texture {
+        Some(_) => widgets::cover(ui, &p, art, texture, 22),
+        None => {
+            ui.painter().circle_filled(art.center(), 22.0, p.raised);
+            widgets::paint_icon(ui.painter(), art.shrink(12.0), Icon::Artist, p.dim);
+        }
+    }
+    let x = art.right() + 14.0;
+    paint_text(
+        ui,
+        pos2(x, rect.center().y),
+        &artist.name,
+        theme::strong_font(14.5),
+        p.text,
+        rect.right() - x - 10.0,
+    );
+    if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        app.navigate(ViewKey::Artist(artist.id.clone()));
+    }
+}
+
 fn playlist_row(app: &mut App, ui: &mut Ui, playlist: &PlaylistSummary) {
     let p = app.palette;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
@@ -840,13 +904,28 @@ fn playlist_row(app: &mut App, ui: &mut Ui, playlist: &PlaylistSummary) {
 // ----------------------------------------------------------------------------
 // Player bar
 
+/// Inner margins of the player bar.
+const PLAYER_MARGIN_X: i8 = 20;
+const PLAYER_MARGIN_Y: i8 = 10;
+
 fn player_bar(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
-    let left_w = (full.width() * 0.3).clamp(180.0, 360.0);
-    let right_w = (full.width() * 0.24).clamp(150.0, 250.0);
+    // Background: a blurred gradient made from the cover's colors.
+    let frame = full.expand2(vec2(f32::from(PLAYER_MARGIN_X), f32::from(PLAYER_MARGIN_Y)));
+    if let Some(texture) = app.ambient(&ui.ctx().clone()) {
+        let painter = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(frame);
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        painter.add(
+            egui::epaint::RectShape::filled(frame, CornerRadius::same(RADIUS_SURFACE), Color32::WHITE)
+                .with_texture(texture, uv),
+        );
+    }
+    let left_w = (full.width() * 0.3).clamp(210.0, 380.0);
+    let right_w = (full.width() * 0.25).clamp(190.0, 300.0);
     let left = Rect::from_min_size(full.min, vec2(left_w, full.height()));
     let right = Rect::from_min_max(pos2(full.right() - right_w, full.top()), full.max);
-    let center = Rect::from_min_max(pos2(left.right(), full.top()), pos2(right.left(), full.bottom()));
+    let center =
+        Rect::from_min_max(pos2(left.right() + 12.0, full.top()), pos2(right.left() - 12.0, full.bottom()));
     ui.scope_builder(UiBuilder::new().max_rect(left), |ui| now_playing(app, ui, left));
     ui.scope_builder(UiBuilder::new().max_rect(center), |ui| controls(app, ui, center));
     ui.scope_builder(UiBuilder::new().max_rect(right).layout(Layout::right_to_left(Align::Center)), |ui| {
@@ -856,8 +935,9 @@ fn player_bar(app: &mut App, ui: &mut Ui) {
 
 fn volume_and_queue(app: &mut App, ui: &mut Ui, width: f32) {
     let p = app.palette;
+    ui.spacing_mut().item_spacing.x = 6.0;
     let (response, committed, _) =
-        widgets::bar(ui, &p, (width - 90.0).clamp(60.0, 120.0), app.settings.volume, true);
+        widgets::bar(ui, &p, (width - 116.0).clamp(70.0, 160.0), app.settings.volume, true);
     let _ = response.on_hover_text(format!("Volume {:.0} % (Ctrl+↑/↓)", app.settings.volume * 100.0));
     if let Some(v) = committed {
         app.player.volume_before_mute = None;
@@ -868,7 +948,7 @@ fn volume_and_queue(app: &mut App, ui: &mut Ui, width: f32) {
         v if v < 0.5 => 1,
         _ => 2,
     };
-    if widgets::round_button(ui, &p, Icon::Volume { level }, 32.0, ButtonStyle::Plain, false)
+    if widgets::icon_button(ui, &p, Icon::Volume { level }, 48.0, 32.0, ButtonStyle::Bright, false)
         .on_hover_text("Couper / rétablir le son")
         .clicked()
     {
@@ -881,7 +961,7 @@ fn volume_and_queue(app: &mut App, ui: &mut Ui, width: f32) {
         }
     }
     let in_queue = app.view == ViewKey::Queue;
-    if widgets::round_button(ui, &p, Icon::Queue, 32.0, ButtonStyle::Plain, in_queue)
+    if widgets::icon_button(ui, &p, Icon::Queue, 48.0, 32.0, ButtonStyle::Bright, in_queue)
         .on_hover_text("File d'attente")
         .clicked()
     {
@@ -906,15 +986,21 @@ fn now_playing(app: &mut App, ui: &mut Ui, rect: Rect) {
     };
     let mut x = rect.left();
     if app.settings.show_covers {
-        let art = Rect::from_min_size(pos2(x, cy - 28.0), vec2(56.0, 56.0));
+        let art = Rect::from_min_size(pos2(x, cy - 36.0), vec2(72.0, 72.0));
         let texture = app.cover(track.image.as_ref());
-        widgets::cover(ui, &p, art, texture, 10);
-        x += 68.0;
+        widgets::cover(ui, &p, art, texture, 12);
+        x += 88.0;
     }
-    let text_w = (rect.right() - x - 44.0).max(40.0);
-    let title = paint_text(ui, pos2(x, cy - 9.0), &track.name, theme::strong_font(14.5), p.text, text_w);
-    let artists =
-        paint_text(ui, pos2(x, cy + 11.0), &track.artists_joined(), theme::small_font(), p.dim, text_w);
+    let text_w = (rect.right() - x - 56.0).max(40.0);
+    let title = paint_text(ui, pos2(x, cy - 12.0), &track.name, theme::strong_font(17.0), p.text, text_w);
+    let artists = paint_text(
+        ui,
+        pos2(x, cy + 13.0),
+        &track.artists_joined(),
+        egui::FontId::proportional(14.0),
+        Color32::from_gray(0xc8),
+        text_w,
+    );
     if !track.album_id.is_empty() && widgets::text_link(ui, Id::new("np-title"), title, &p).clicked() {
         app.navigate(ViewKey::Album(track.album_id.clone()));
     }
@@ -923,14 +1009,22 @@ fn now_playing(app: &mut App, ui: &mut Ui, rect: Rect) {
     {
         app.navigate(ViewKey::Artist(artist.id.clone()));
     }
-    let heart_x = (x + title.width().max(artists.width()) + 24.0).min(rect.right() - 16.0);
-    let heart_rect = Rect::from_center_size(pos2(heart_x, cy), vec2(32.0, 32.0));
+    let heart_x = (x + title.width().max(artists.width()) + 32.0).min(rect.right() - 24.0);
+    let heart_rect = Rect::from_center_size(pos2(heart_x, cy), vec2(46.0, 46.0));
     let liked = app.player.is_liked() == Some(true);
     let clicked = ui
         .scope_builder(UiBuilder::new().max_rect(heart_rect), |ui| {
-            widgets::round_button(ui, &p, Icon::Heart { filled: liked }, 32.0, ButtonStyle::Plain, false)
-                .on_hover_text("J'aime (Ctrl+L)")
-                .clicked()
+            widgets::icon_button(
+                ui,
+                &p,
+                Icon::Heart { filled: liked },
+                46.0,
+                34.0,
+                ButtonStyle::Bright,
+                false,
+            )
+            .on_hover_text("J'aime (Ctrl+L)")
+            .clicked()
         })
         .inner;
     if clicked {
@@ -941,11 +1035,19 @@ fn now_playing(app: &mut App, ui: &mut Ui, rect: Rect) {
 fn controls(app: &mut App, ui: &mut Ui, rect: Rect) {
     let p = app.palette;
     let has_track = app.player.now.is_some() || app.player.context.is_some();
-    let row_w = 32.0 * 2.0 + 36.0 * 2.0 + 42.0 + 4.0 * 14.0;
-    let row = Rect::from_center_size(pos2(rect.center().x, rect.top() + 22.0), vec2(row_w, 42.0));
+    // Large buttons with large icons, spread over the middle zone; scaled down
+    // only when the window is too narrow for them.
+    let (toggle, skip, play) = (50.0, 56.0, 64.0);
+    let buttons = toggle * 2.0 + skip * 2.0 + play;
+    let k = (rect.width() / (buttons + 4.0 * 16.0)).clamp(0.6, 1.0);
+    let (toggle, skip, play) = (toggle * k, skip * k, play * k);
+    let gap = ((rect.width() - buttons * k) / 4.0).clamp(8.0, 30.0);
+    let row_w = buttons * k + gap * 4.0;
+    let row = Rect::from_center_size(pos2(rect.center().x, rect.top() + play * 0.5), vec2(row_w, play));
     ui.scope_builder(UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)), |ui| {
-        ui.spacing_mut().item_spacing.x = 14.0;
-        if widgets::round_button(ui, &p, Icon::Shuffle, 32.0, ButtonStyle::Plain, app.player.shuffle)
+        ui.spacing_mut().item_spacing.x = gap;
+        let shuffle = app.player.shuffle;
+        if widgets::icon_button(ui, &p, Icon::Shuffle, toggle, toggle * 0.72, ButtonStyle::Plain, shuffle)
             .on_hover_text("Lecture aléatoire")
             .clicked()
         {
@@ -953,21 +1055,21 @@ fn controls(app: &mut App, ui: &mut Ui, rect: Rect) {
             app.settings.shuffle = app.player.shuffle;
             app.send(Command::SetShuffle(app.player.shuffle));
         }
-        if widgets::round_button(ui, &p, Icon::Prev, 36.0, ButtonStyle::Plain, false)
+        if widgets::icon_button(ui, &p, Icon::Prev, skip, skip * 0.8, ButtonStyle::Bright, false)
             .on_hover_text("Précédent (Ctrl+←)")
             .clicked()
         {
             app.send(Command::Previous);
         }
         let icon = if app.player.playing { Icon::Pause } else { Icon::Play };
-        if widgets::round_button(ui, &p, icon, 42.0, ButtonStyle::Accent, false)
+        if widgets::icon_button(ui, &p, icon, play, play * 0.68, ButtonStyle::Accent, false)
             .on_hover_text("Lecture / pause (Espace)")
             .clicked()
             && has_track
         {
             app.send(Command::PlayPause);
         }
-        if widgets::round_button(ui, &p, Icon::Next, 36.0, ButtonStyle::Plain, false)
+        if widgets::icon_button(ui, &p, Icon::Next, skip, skip * 0.8, ButtonStyle::Bright, false)
             .on_hover_text("Suivant (Ctrl+→)")
             .clicked()
         {
@@ -975,7 +1077,8 @@ fn controls(app: &mut App, ui: &mut Ui, rect: Rect) {
         }
         let repeat = app.player.repeat;
         let icon = Icon::Repeat { one: repeat == Repeat::One };
-        if widgets::round_button(ui, &p, icon, 32.0, ButtonStyle::Plain, repeat != Repeat::Off)
+        let on = repeat != Repeat::Off;
+        if widgets::icon_button(ui, &p, icon, toggle, toggle * 0.72, ButtonStyle::Plain, on)
             .on_hover_text("Répéter : non / tout / ce titre")
             .clicked()
         {
@@ -986,10 +1089,10 @@ fn controls(app: &mut App, ui: &mut Ui, rect: Rect) {
         }
     });
 
-    // Progress row.
+    // Progress row, as wide as the middle zone allows.
     let duration = app.player.now.as_ref().map_or(0, |t| t.duration_ms);
     let position = app.player.position();
-    let bar_w = (rect.width() - 2.0 * 60.0).clamp(80.0, 560.0);
+    let bar_w = (rect.width() - 2.0 * 58.0).clamp(120.0, 720.0);
     let cy = rect.bottom() - 10.0;
     let bar_rect = Rect::from_center_size(pos2(rect.center().x, cy), vec2(bar_w, 18.0));
     let fraction = if duration > 0 { position as f32 / duration as f32 } else { 0.0 };
@@ -1005,14 +1108,15 @@ fn controls(app: &mut App, ui: &mut Ui, rect: Rect) {
     } else {
         format_duration((shown * duration as f32) as u32)
     };
-    let font = theme::small_font();
-    ui.painter().text(pos2(bar_rect.left() - 12.0, cy), Align2::RIGHT_CENTER, label, font.clone(), p.dim);
+    let font = egui::FontId::proportional(13.5);
+    let clock = Color32::from_gray(0xc8);
+    ui.painter().text(pos2(bar_rect.left() - 12.0, cy), Align2::RIGHT_CENTER, label, font.clone(), clock);
     ui.painter().text(
         pos2(bar_rect.right() + 12.0, cy),
         Align2::LEFT_CENTER,
         format_duration(duration),
         font,
-        p.dim,
+        clock,
     );
     if let Some(v) = committed {
         let ms = (v * duration as f32) as u32;
@@ -1032,180 +1136,140 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
     ui.add_space(12.0);
     let mut changed = false;
     ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
-        ui.set_max_width(660.0);
+        ui.set_max_width(620.0);
 
-        card(ui, &p, "Application Spotify", |ui| {
+        card(ui, &p, "Compte", |ui| {
             let status = app.app_status.clone();
-            let id = mask_id(&status.client_id);
-            let text = match status.state {
-                AppState::Connected if status.has_secret => format!("Connectée · Client ID {id} · secret enregistré"),
-                AppState::Connected => format!("Connectée · Client ID {id}"),
-                AppState::Authorizing => "En attente de votre accord dans le navigateur…".to_string(),
-                AppState::Disconnected => format!("Autorisation expirée ou révoquée · Client ID {id}"),
-                _ => "Aucune application configurée".to_string(),
+            let state = match status.state {
+                AppState::Connected if !app.user.is_empty() => app.user.clone(),
+                AppState::Connected => "Connecté".to_string(),
+                AppState::Authorizing => "Autorisation en cours…".to_string(),
+                AppState::Disconnected => "Déconnecté".to_string(),
+                _ => "Aucune application".to_string(),
             };
-            ui.label(RichText::new(text).color(p.text));
-            ui.label(
-                RichText::new("Elle sert à la bibliothèque, à la recherche et à la lecture.").small().color(p.faint),
-            );
-            if status.needs_playback_auth {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Cette application n'a pas encore autorisé la lecture : un clic suffit.")
-                        .color(p.text),
-                );
-            }
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                if status.needs_playback_auth && widgets::pill(ui, &p, "Autoriser la lecture", true).clicked() {
-                    app.send(Command::ReconnectApp);
-                }
-                if status.state == AppState::Disconnected && widgets::pill(ui, &p, "Reconnecter", true).clicked() {
-                    app.send(Command::ReconnectApp);
-                }
-                if widgets::pill(ui, &p, "Modifier les identifiants", false).clicked() {
-                    app.editing_app = true;
-                    app.setup_id = status.client_id.clone();
-                    app.setup_secret.clear();
-                }
-                if !status.client_id.is_empty() && widgets::pill(ui, &p, "Oublier l'application", false).clicked() {
-                    app.send(Command::ForgetApp);
-                    app.setup_id.clear();
-                    app.setup_secret.clear();
-                }
+            option_row(ui, &p, "Spotify", |ui| {
+                ui.label(RichText::new(state).color(p.text));
             });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Port de l'URI de redirection").color(p.dim));
-                ui.add(egui::TextEdit::singleline(&mut app.port_draft).desired_width(64.0).margin(Margin::symmetric(8, 5)));
+            option_row(ui, &p, "Client ID", |ui| {
+                ui.label(RichText::new(mask_id(&status.client_id)).monospace().color(p.dim));
+            });
+            option_row(ui, &p, "Port de redirection", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.port_draft)
+                        .desired_width(64.0)
+                        .margin(Margin::symmetric(8, 5)),
+                );
                 let draft = app.port_draft.trim().parse::<u16>().ok().filter(|port| *port >= 1024);
                 if let Some(port) = draft.filter(|port| *port != app.settings.redirect_port)
                     && widgets::pill(ui, &p, "Enregistrer", true).clicked()
                 {
                     app.settings.redirect_port = port;
                     changed = true;
-                    app.toast(format!("Pensez à déclarer http://127.0.0.1:{port}/login dans votre application Spotify."), false);
+                    app.toast(
+                        format!("Déclarez http://127.0.0.1:{port}/login dans votre application Spotify."),
+                        false,
+                    );
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if status.needs_playback_auth && widgets::pill(ui, &p, "Autoriser", true).clicked() {
+                    app.send(Command::ReconnectApp);
+                }
+                if status.state == AppState::Disconnected
+                    && widgets::pill(ui, &p, "Reconnecter", true).clicked()
+                {
+                    app.send(Command::ReconnectApp);
+                }
+                if widgets::pill(ui, &p, "Modifier l'application", false).clicked() {
+                    app.editing_app = true;
+                    app.setup_id = status.client_id.clone();
+                    app.setup_secret.clear();
+                }
+                if !status.client_id.is_empty()
+                    && widgets::pill(ui, &p, "Oublier l'application", false).clicked()
+                {
+                    app.send(Command::ForgetApp);
+                    app.setup_id.clear();
+                    app.setup_secret.clear();
+                }
+                if widgets::pill(ui, &p, "Se déconnecter", false).clicked() {
+                    app.send(Command::Logout);
                 }
             });
         });
 
         card(ui, &p, "Lecture", |ui| {
-            let mut state = format!("Lecteur : {}", app.engine_status);
-            if app.engine_memory > 0 {
-                state.push_str(&format!(" · {}", human_bytes(app.engine_memory)));
-            }
-            ui.label(RichText::new(state).color(p.text));
-            ui.label(
-                RichText::new(
-                    "Le son vient du lecteur officiel de Spotify, invisible, déchiffré par le DRM d'Edge \
-                     (WebView2) comme dans un navigateur. Il démarre à la première lecture.",
-                )
-                .small()
-                .color(p.faint),
-            );
-            ui.add_space(10.0);
-            ui.label(RichText::new("Mettre le lecteur en veille après une pause de").color(p.dim));
-            ui.horizontal_wrapped(|ui| {
+            option_row(ui, &p, "Lecteur", |ui| {
+                let mut state = app.engine_status.clone();
+                if app.engine_memory > 0 {
+                    state.push_str(&format!(" · {}", human_bytes(app.engine_memory)));
+                }
+                ui.label(RichText::new(state).color(p.text));
+            });
+            option_row(ui, &p, "Veille après une pause", |ui| {
                 for (minutes, label) in [(5, "5 min"), (10, "10 min"), (30, "30 min"), (0, "Jamais")] {
-                    changed |= ui.radio_value(&mut app.settings.engine_idle_minutes, minutes, label).changed();
+                    changed |=
+                        ui.radio_value(&mut app.settings.engine_idle_minutes, minutes, label).changed();
                 }
             });
-            ui.label(
-                RichText::new("En veille, ses processus rendent leur mémoire ; la reprise prend quelques secondes.")
-                    .small()
-                    .color(p.faint),
-            );
-        });
-
-        card(ui, &p, "Économie de données", |ui| {
-            changed |= ui
-                .checkbox(&mut app.settings.show_covers, "Afficher les pochettes (vignettes 64 px, gardées en cache)")
-                .changed();
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!(
-                    "Cette session : {} pour la bibliothèque et les pochettes, {} pour l'audio.",
-                    human_bytes(app.usage.0),
-                    human_bytes(app.usage.1)
-                ))
-                .color(p.dim),
-            );
-            ui.label(
-                RichText::new("Le débit audio est choisi par Spotify (AAC, en général 128 à 256 kbit/s).")
-                    .small()
-                    .color(p.faint),
-            );
-            ui.add_space(8.0);
-            if widgets::pill(ui, &p, "Vider le cache", false).clicked() {
-                app.send(Command::ClearCache);
-            }
         });
 
         card(ui, &p, "Affichage", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Taille du texte").color(p.dim));
+            option_row(ui, &p, "Taille du texte", |ui| {
                 for (scale, label) in [(0.9, "90 %"), (1.0, "100 %"), (1.15, "115 %"), (1.3, "130 %")] {
                     changed |= ui.radio_value(&mut app.settings.ui_scale, scale, label).changed();
                 }
             });
+            option_row(ui, &p, "Pochettes", |ui| {
+                changed |= ui.checkbox(&mut app.settings.show_covers, "").changed();
+            });
         });
 
-        card(ui, &p, "Mémoire", |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "SpotiLite : {} (ensemble de travail privé, la valeur du Gestionnaire des tâches).",
-                    human_bytes(app.memory.private_working_set),
-                ))
-                .color(p.dim),
-            );
-            let engine = if app.engine_memory > 0 {
-                format!("Lecteur (processus WebView2) : {}.", human_bytes(app.engine_memory))
-            } else {
-                "Lecteur : arrêté, aucune mémoire utilisée.".to_string()
-            };
-            ui.label(RichText::new(engine).color(p.dim));
-            ui.label(
-                RichText::new(
-                    "L'interface est dessinée par le processeur : aucun pilote graphique n'est chargé.",
-                )
-                .small()
-                .color(p.faint),
-            );
-            ui.add_space(6.0);
-            changed |= ui
-                .checkbox(&mut app.settings.trim_when_minimized, "Libérer la mémoire quand la fenêtre est réduite")
-                .changed();
+        card(ui, &p, "Mémoire et données", |ui| {
+            option_row(ui, &p, "Utilisée", |ui| {
+                let mut text = human_bytes(app.memory.private_working_set);
+                if app.engine_memory > 0 {
+                    text.push_str(&format!(" + lecteur {}", human_bytes(app.engine_memory)));
+                }
+                ui.label(RichText::new(text).color(p.text));
+            });
+            option_row(ui, &p, "Libérer quand réduite", |ui| {
+                changed |= ui.checkbox(&mut app.settings.trim_when_minimized, "").changed();
+            });
+            option_row(ui, &p, "Données de la session", |ui| {
+                ui.label(RichText::new(human_bytes(app.usage.0 + app.usage.1)).color(p.text));
+            });
+            option_row(ui, &p, "Cache", |ui| {
+                if widgets::pill(ui, &p, "Vider", false).clicked() {
+                    app.send(Command::ClearCache);
+                }
+            });
         });
 
-        card(ui, &p, "Compte", |ui| {
-            let user = if app.user.is_empty() { "—".to_string() } else { app.user.clone() };
-            ui.label(RichText::new(format!("Connecté : {user}")).color(p.text));
-            ui.add_space(6.0);
-            if widgets::pill(ui, &p, "Se déconnecter", false).clicked() {
-                app.send(Command::Logout);
-            }
-            ui.label(
-                RichText::new("La déconnexion efface aussi la bibliothèque en cache ; l'application reste enregistrée.")
-                    .small()
-                    .color(p.faint),
-            );
-        });
-
-        card(ui, &p, "À propos", |ui| {
-            ui.label(RichText::new(format!("SpotiLite {}", env!("CARGO_PKG_VERSION"))).color(p.text));
-            ui.label(RichText::new(format!("Réglages : {}", app.paths.config.display())).small().color(p.dim));
-            ui.label(RichText::new(format!("Cache : {}", app.paths.cache.display())).small().color(p.dim));
-            ui.label(
-                RichText::new("Raccourcis : Espace lecture/pause · Ctrl+←/→ titre précédent/suivant · Ctrl+↑/↓ volume · Ctrl+F recherche · Ctrl+L j'aime · Alt+← retour · ↑/↓ + Entrée dans les listes")
-                    .small()
-                    .color(p.faint),
-            );
-        });
+        ui.label(RichText::new(format!("SpotiLite {}", env!("CARGO_PKG_VERSION"))).small().color(p.faint));
         ui.add_space(16.0);
     });
     if changed {
         app.apply_settings(&ctx);
     }
+}
+
+/// One setting: its name on the left, the control on the right.
+fn option_row(ui: &mut Ui, p: &theme::Palette, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(34.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(190.0, 34.0), Sense::hover());
+        paint_text(
+            ui,
+            pos2(rect.left(), rect.center().y),
+            label,
+            theme::body_font(),
+            p.dim,
+            rect.width() - 8.0,
+        );
+        add(ui);
+    });
 }
 
 fn card(ui: &mut Ui, p: &theme::Palette, title: &str, add: impl FnOnce(&mut Ui)) {

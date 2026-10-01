@@ -4,6 +4,7 @@
 //! Rendering is reactive: nothing is redrawn unless something happens (input,
 //! backend event, or once per second while music plays), so the CPU stays idle.
 
+mod ambient;
 mod theme;
 mod views;
 mod widgets;
@@ -17,7 +18,7 @@ use egui::{Key, Modifiers, TextureHandle, TextureOptions};
 use crate::backend::{AppState, AppStatus, Backend, Command, Event};
 use crate::config::{Paths, Settings};
 use crate::media::MediaKeys;
-use crate::model::{AlbumSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
+use crate::model::{AlbumSummary, ArtistSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
 use crate::sys;
 use theme::Palette;
 
@@ -27,6 +28,8 @@ const MAX_PAGES: usize = 12;
 const MAX_TEXTURES: usize = 48;
 
 pub enum Page {
+    /// Artists the user follows.
+    Artists(Vec<ArtistSummary>),
     Tracks {
         title: String,
         subtitle: String,
@@ -106,8 +109,12 @@ struct Filtered {
 #[derive(Default)]
 struct Covers {
     textures: HashMap<String, TextureHandle>,
+    /// Colors of each cover, for the player bar background.
+    tints: HashMap<String, ambient::Tint>,
     order: VecDeque<String>,
     requested: HashSet<String>,
+    /// Blurred gradient of the current cover (url, texture).
+    ambient: Option<(String, TextureHandle)>,
 }
 
 pub struct App {
@@ -215,7 +222,7 @@ impl App {
 
     /// `SPOTILITE_DEMO=1` (debug builds) fills the interface with fake data.
     #[cfg(debug_assertions)]
-    pub fn with_demo(mut self) -> Self {
+    pub fn with_demo(mut self, ctx: &egui::Context) -> Self {
         use crate::model::ArtistRef;
         if std::env::var_os("SPOTILITE_DEMO").is_none() {
             return self;
@@ -252,7 +259,28 @@ impl App {
                     snapshot_id: String::new(),
                 })
                 .collect();
-        self.player.now = Some(tracks[2].clone());
+        // A synthetic cover (dusk gradient) to show the player bar colors.
+        let demo_cover = "demo-cover".to_string();
+        let image = egui::ColorImage::new(
+            [64, 64],
+            (0..64 * 64)
+                .map(|i| {
+                    let (x, y) = ((i % 64) as f32 / 63.0, (i / 64) as f32 / 63.0);
+                    let t = (x + y) / 2.0;
+                    egui::Color32::from_rgb(
+                        (90.0 + 160.0 * t) as u8,
+                        (40.0 + 70.0 * t * t) as u8,
+                        (150.0 - 110.0 * t) as u8,
+                    )
+                })
+                .collect(),
+        );
+        self.covers.tints.insert(demo_cover.clone(), ambient::tint_of(&image));
+        let texture = ctx.load_texture(demo_cover.clone(), image, TextureOptions::LINEAR);
+        self.covers.textures.insert(demo_cover.clone(), texture);
+        let mut now = tracks[2].clone();
+        now.image = Some(demo_cover);
+        self.player.now = Some(now);
         self.player.playing = true;
         self.player.position_ms = 83_000;
         self.player.at = Some(Instant::now());
@@ -270,10 +298,17 @@ impl App {
         );
         self.engine_status = "Prêt · DRM Widevine".into();
         self.engine_memory = 112 * 1024 * 1024;
+        let followed = ["Atlas Sud", "Kaito", "Les Ondes", "Mélodie Brune", "Nora Vale"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ArtistSummary { id: format!("a{i}"), name: (*name).into(), image: None })
+            .collect();
+        self.pages.insert(ViewKey::Artists, Page::Artists(followed));
         if let Ok(view) = std::env::var("SPOTILITE_DEMO_VIEW") {
             self.view = match view.as_str() {
                 "settings" => ViewKey::Settings,
                 "queue" => ViewKey::Queue,
+                "artists" => ViewKey::Artists,
                 _ => ViewKey::Liked,
             };
             self.history.push(ViewKey::Liked);
@@ -370,6 +405,7 @@ impl App {
                 self.store_page(view, Page::Context { title, subtitle, uri, total });
             }
             Event::Albums { view, title, albums } => self.store_page(view, Page::Albums { title, albums }),
+            Event::FollowedArtists(artists) => self.store_page(ViewKey::Artists, Page::Artists(artists)),
             Event::Artist { id, name, top, albums } => {
                 self.store_page(ViewKey::Artist(id), Page::Artist { name, top, albums });
             }
@@ -402,12 +438,14 @@ impl App {
             }
             Event::Image { url, image } => {
                 if let Some(image) = image {
+                    self.covers.tints.insert(url.clone(), ambient::tint_of(&image));
                     let texture = ctx.load_texture(url.clone(), image, TextureOptions::LINEAR);
                     self.covers.textures.insert(url.clone(), texture);
                     self.covers.order.push_back(url);
                     while self.covers.order.len() > MAX_TEXTURES {
                         if let Some(old) = self.covers.order.pop_front() {
                             self.covers.textures.remove(&old);
+                            self.covers.tints.remove(&old);
                             self.covers.requested.remove(&old);
                         }
                     }
@@ -440,6 +478,28 @@ impl App {
         let name = url.rsplit('/').next()?;
         let path = self.paths.image_cache().join(format!("{name}.jpg"));
         path.exists().then(|| path.to_string_lossy().into_owned())
+    }
+
+    /// Blurred gradient of the current track's cover, for the player bar.
+    fn ambient(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        let url = self.player.now.as_ref()?.image.clone()?;
+        if !self.settings.show_covers {
+            return None;
+        }
+        if let Some((current, texture)) = &self.covers.ambient
+            && *current == url
+        {
+            return Some(texture.id());
+        }
+        let Some(tint) = self.covers.tints.get(&url) else {
+            // Arrives with the cover itself.
+            self.cover(Some(&url));
+            return None;
+        };
+        let texture = ctx.load_texture("ambient", ambient::ambient_image(tint), TextureOptions::LINEAR);
+        let id = texture.id();
+        self.covers.ambient = Some((url, texture));
+        Some(id)
     }
 
     /// Returns the cover texture for `url`, asking the backend for it if needed.
@@ -599,7 +659,7 @@ impl App {
             Page::Tracks { tracks, .. } => tracks.clone(),
             Page::Artist { top, .. } => top.clone(),
             Page::Search(results) => results.tracks.clone(),
-            Page::Albums { .. } | Page::Context { .. } => return None,
+            Page::Albums { .. } | Page::Artists(_) | Page::Context { .. } => return None,
         };
         let query = self.filter.trim().to_lowercase();
         if query.is_empty() {
@@ -634,8 +694,10 @@ impl App {
         if minimized && !self.minimized && self.settings.trim_when_minimized {
             // Give memory back to Windows while the window is not visible.
             self.covers.textures.clear();
+            self.covers.tints.clear();
             self.covers.order.clear();
             self.covers.requested.clear();
+            self.covers.ambient = None;
             sys::trim_working_set();
         }
         self.minimized = minimized;

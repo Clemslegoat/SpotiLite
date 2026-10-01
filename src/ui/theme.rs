@@ -54,7 +54,7 @@ pub const RADIUS_ROW: u8 = 10;
 pub const GAP: i8 = 8;
 
 pub const ROW_HEIGHT: f32 = 46.0;
-pub const PLAYER_HEIGHT: f32 = 84.0;
+pub const PLAYER_HEIGHT: f32 = 116.0;
 pub const SIDEBAR_WIDTH: f32 = 236.0;
 
 pub fn heading_font() -> FontId {
@@ -111,7 +111,7 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         v.window_shadow = Shadow::NONE;
         v.popup_shadow = Shadow::NONE;
         v.extreme_bg_color = p.raised;
-        v.text_edit_bg_color = Some(p.raised);
+        v.text_edit_bg_color = Some(Color32::from_rgb(0x21, 0x21, 0x21));
         v.faint_bg_color = p.surface;
         v.hyperlink_color = p.accent;
         v.error_fg_color = p.danger;
@@ -144,8 +144,10 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
             state.corner_radius = radius;
             state.expansion = 0.0;
         }
-        // Visible outlines for checkboxes, radio buttons and text fields.
-        w.inactive.bg_stroke = Stroke::new(1.0, p.line);
+        // Checkboxes, radio buttons and fields stand out on the cards too.
+        w.inactive.bg_fill = Color32::from_rgb(0x27, 0x27, 0x27);
+        w.inactive.weak_bg_fill = p.raised;
+        w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3a, 0x3a));
         w.hovered.bg_stroke = Stroke::new(1.0, p.faint);
     });
 }

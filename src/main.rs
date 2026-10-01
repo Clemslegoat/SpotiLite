@@ -28,7 +28,7 @@ fn main() {
     let result = window::run(options, move |ctx, window| {
         let app = ui::App::new(ctx, window, paths, settings);
         #[cfg(debug_assertions)]
-        let app = app.with_demo();
+        let app = app.with_demo(ctx);
         app
     });
     if let Err(e) = result {
