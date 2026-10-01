@@ -597,8 +597,8 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
         response.on_hover_cursor(if track.playable { CursorIcon::Default } else { CursorIcon::NotAllowed });
     if refused {
         response = response.on_hover_text(
-            "Spotify réserve la lecture de ce titre à ses applications officielles : \
-             il est sauté automatiquement. Double-cliquez pour réessayer.",
+            "Spotify a refusé la clé de déchiffrement de ce titre (code 0x0001), dans toutes les \
+             qualités : il est sauté automatiquement. Double-cliquez pour réessayer.",
         );
     }
     if link_clicked {
@@ -1044,6 +1044,23 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
             changed |= ui
                 .checkbox(&mut app.settings.normalisation, "Normaliser le volume entre les titres")
                 .changed();
+            let refused = app.refused.len();
+            if refused > 0 {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{refused} titre{} refusé{} par Spotify (clé de déchiffrement), sauté{} automatiquement.",
+                        if refused > 1 { "s" } else { "" },
+                        if refused > 1 { "s" } else { "" },
+                        if refused > 1 { "s" } else { "" },
+                    ))
+                    .color(p.dim),
+                );
+                ui.add_space(4.0);
+                if widgets::pill(ui, &p, "Réessayer ces titres", false).clicked() {
+                    app.send(Command::ClearRefused);
+                }
+            }
         });
 
         card(ui, &p, "Affichage", |ui| {

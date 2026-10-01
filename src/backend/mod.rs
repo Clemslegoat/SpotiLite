@@ -74,6 +74,8 @@ pub enum Command {
     FetchImage(String),
     ApplySettings(Box<Settings>),
     ClearCache,
+    /// Gives the tracks Spotify refused another chance.
+    ClearRefused,
     Shutdown,
 }
 
@@ -272,6 +274,23 @@ struct CachedArtist {
     albums: Vec<AlbumSummary>,
 }
 
+fn bitrate(quality: Quality) -> Bitrate {
+    match quality {
+        Quality::Eco => Bitrate::Bitrate96,
+        Quality::Normal => Bitrate::Bitrate160,
+        Quality::High => Bitrate::Bitrate320,
+    }
+}
+
+/// Next quality to try when Spotify refuses the key of a track's file.
+fn next_quality(quality: Quality) -> Option<Quality> {
+    match quality {
+        Quality::Eco => Some(Quality::Normal),
+        Quality::Normal => Some(Quality::High),
+        Quality::High => None,
+    }
+}
+
 /// Consecutive refused tracks before concluding the whole account is refused.
 const MAX_REFUSED_IN_A_ROW: u32 = 10;
 const REFUSED_TTL_SECS: u64 = 14 * 24 * 3600;
@@ -313,6 +332,11 @@ struct Core {
     /// Tracks whose audio key Spotify refused (id → when), kept 14 days.
     refused: HashMap<String, u64>,
     skipped_refused: u32,
+    /// Quality the player currently uses: the chosen one, or a higher one when
+    /// Spotify refused the key of the lower quality file.
+    quality: Quality,
+    /// Quality at which the current track was first attempted.
+    attempt_quality: Option<Quality>,
     listened_ms: u64,
     audio_bytes: u64,
     last_usage: (u64, u64),
@@ -366,6 +390,8 @@ impl Core {
             reconnect_tried: false,
             refused: HashMap::new(),
             skipped_refused: 0,
+            quality: settings.quality,
+            attempt_quality: None,
             listened_ms: 0,
             audio_bytes: 0,
             last_usage: (u64::MAX, u64::MAX),
@@ -735,6 +761,10 @@ impl Core {
             Command::FetchImage(url) => self.fetch_image(url),
             Command::ApplySettings(settings) => self.apply_settings(*settings).await,
             Command::ClearCache => self.clear_cache(),
+            Command::ClearRefused => {
+                self.clear_refused();
+                self.ui.send(Event::Info("Les titres refusés seront retentés.".into()));
+            }
             Command::Shutdown => {}
         }
     }
@@ -847,7 +877,7 @@ impl Core {
     fn send_usage(&mut self) {
         let listened =
             self.listened_ms + if self.playing { self.position_at.elapsed().as_millis() as u64 } else { 0 };
-        let audio = self.audio_bytes + listened * u64::from(self.settings.quality.kbps()) / 8;
+        let audio = self.audio_bytes + listened * u64::from(self.quality.kbps()) / 8;
         let api = self.api_bytes.load(Ordering::Relaxed);
         if (api, audio) != self.last_usage {
             self.last_usage = (api, audio);
@@ -856,10 +886,16 @@ impl Core {
     }
 
     async fn apply_settings(&mut self, new: Settings) {
+        if new.quality != self.settings.quality {
+            // Refusals may depend on the file format: give every track a new chance.
+            self.clear_refused();
+        }
         self.settings = new;
-        let audio_changed = self.audio.as_ref().is_some_and(|a| {
-            a.quality != self.settings.quality || a.normalisation != self.settings.normalisation
-        });
+        self.quality = self.settings.quality;
+        let audio_changed = self
+            .audio
+            .as_ref()
+            .is_some_and(|a| a.quality != self.quality || a.normalisation != self.settings.normalisation);
         if audio_changed {
             // The bitrate is fixed when the player is created: rebuild it and resume.
             self.flush_listened();
@@ -911,11 +947,7 @@ impl Core {
             };
             mixer.set_volume(volume_to_u16(self.settings.volume));
             let config = PlayerConfig {
-                bitrate: match self.settings.quality {
-                    Quality::Eco => Bitrate::Bitrate96,
-                    Quality::Normal => Bitrate::Bitrate160,
-                    Quality::High => Bitrate::Bitrate320,
-                },
+                bitrate: bitrate(self.quality),
                 normalisation: self.settings.normalisation,
                 gapless: true,
                 ..PlayerConfig::default()
@@ -932,7 +964,7 @@ impl Core {
                 player,
                 mixer,
                 events,
-                quality: self.settings.quality,
+                quality: self.quality,
                 normalisation: self.settings.normalisation,
             });
         }
@@ -940,6 +972,7 @@ impl Core {
     }
 
     fn load(&mut self, track: Track, play: bool, position_ms: u32) {
+        self.attempt_quality = None;
         self.load_generation += 1;
         self.load_started = Instant::now();
         self.flush_listened();
@@ -1068,9 +1101,41 @@ impl Core {
         log::warn!("track unavailable ({reason:?}): {messages:?}");
 
         if reason == PlaybackFailure::KeyDenied {
-            // Spotify decides per track: licence-restricted tracks only get their
-            // key through the official apps' DRM. Remember them so they are never
-            // retried (no wasted data), and keep going with the others.
+            // Spotify may refuse the key of one file format and accept another:
+            // try the same track again at the next higher quality.
+            if let (Some(track), Some(next)) = (current.clone(), next_quality(self.quality)) {
+                let first = self.attempt_quality.unwrap_or(self.quality);
+                self.unavailable_streak -= 1;
+                self.ui.send(Event::Notice {
+                    key: "quality",
+                    text: format!(
+                        "Clé refusée en {} kbit/s : nouvel essai en {} kbit/s…",
+                        self.quality.kbps(),
+                        next.kbps()
+                    ),
+                    error: false,
+                });
+                self.quality = next;
+                if let Some(audio) = self.audio.take() {
+                    audio.player.stop();
+                    tokio::task::spawn_blocking(move || drop(audio));
+                }
+                self.load(track, true, 0);
+                self.attempt_quality = Some(first);
+                return;
+            }
+            // Refused in every quality. Remember the track so it is not retried
+            // (no wasted data) and keep going with the others, back at the
+            // quality the attempts started from.
+            if let Some(first) = self.attempt_quality.take()
+                && first != self.quality
+            {
+                self.quality = first;
+                if let Some(audio) = self.audio.take() {
+                    audio.player.stop();
+                    tokio::task::spawn_blocking(move || drop(audio));
+                }
+            }
             if let Some(track) = &current {
                 self.remember_refused(track.id.clone());
             }
@@ -1092,9 +1157,10 @@ impl Core {
             self.ui.send(Event::Notice {
                 key: "refused",
                 text: format!(
-                    "{count} titre{} ignoré{} : Spotify réserve leur lecture à ses applications officielles.",
+                    "{count} titre{} ignoré{} : Spotify refuse {} clé de déchiffrement (code 0x0001), dans toutes les qualités.",
                     if count > 1 { "s" } else { "" },
                     if count > 1 { "s" } else { "" },
+                    if count > 1 { "leur" } else { "sa" },
                 ),
                 error: false,
             });
@@ -1141,6 +1207,14 @@ impl Core {
         });
     }
 
+    /// Forgets the refused tracks: they will be tried again.
+    fn clear_refused(&mut self) {
+        self.refused.clear();
+        self.store.save("refused", &self.refused);
+        self.queue.set_blocked(HashSet::new());
+        self.ui.send(Event::Refused(HashSet::new()));
+    }
+
     fn remember_refused(&mut self, id: String) {
         self.refused.insert(id.clone(), now_secs());
         self.store.save("refused", &self.refused);
@@ -1158,6 +1232,22 @@ impl Core {
                 self.flush_listened();
                 self.unavailable_streak = 0;
                 self.reconnect_tried = false;
+                if let Some(first) = self.attempt_quality.take() {
+                    log::warn!(
+                        "key refused at {} kbit/s, accepted at {} kbit/s",
+                        first.kbps(),
+                        self.quality.kbps()
+                    );
+                    self.ui.send(Event::Notice {
+                        key: "quality",
+                        text: format!(
+                            "Lecture en {} kbit/s : Spotify refuse les clés en {} kbit/s. Cette qualité est gardée jusqu'à la fermeture.",
+                            self.quality.kbps(),
+                            first.kbps()
+                        ),
+                        error: false,
+                    });
+                }
                 self.playing = true;
                 self.position_ms = position_ms;
                 self.position_at = Instant::now();
@@ -1772,6 +1862,13 @@ mod tests {
         crate::logger::remember_for_test("error audio key 0 1");
         let recent = crate::logger::playback_messages_since(Instant::now() - Duration::from_secs(5));
         assert_eq!(PlaybackFailure::from_messages(&recent), PlaybackFailure::KeyDenied);
+    }
+
+    #[test]
+    fn refused_keys_climb_through_qualities() {
+        assert_eq!(next_quality(Quality::Eco), Some(Quality::Normal));
+        assert_eq!(next_quality(Quality::Normal), Some(Quality::High));
+        assert_eq!(next_quality(Quality::High), None);
     }
 
     #[test]

@@ -131,15 +131,15 @@ l'URI de redirection ou d'oublier l'application.
 - Pas de podcasts, de paroles, ni de mode « Spotify Connect » (piloter SpotiLite depuis le
   téléphone) : ces fonctions ont été laissées de côté pour rester léger.
 - Qualité maximale 320 kbit/s (pas de lossless).
-- **Titres refusés par Spotify (code `0x0001`)** : Spotify décide titre par titre s'il accorde la
-  clé de déchiffrement « classique » utilisée par les lecteurs libres. Les titres soumis à
-  certaines licences ne sont plus déchiffrables que par les applications officielles, via le DRM
-  de Spotify (PlayPlay). Aucun lecteur tiers ne peut les lire légitimement, et SpotiLite ne
-  contourne pas ce DRM (ce serait illégal et exposerait votre compte à un bannissement).
-  SpotiLite saute ces titres sans interrompre la lecture, les affiche en grisé et ne les retente
-  plus pendant 14 jours (aucune donnée gaspillée). Un double-clic permet de réessayer. Si Spotify
-  refuse 10 titres d'affilée, la lecture s'arrête : le refus concerne alors sans doute tout le
-  compte ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)).
+- **Titres refusés par Spotify (code `0x0001`)** : depuis 2025, Spotify refuse par moments la
+  clé de déchiffrement « classique » utilisée par les lecteurs libres basés sur librespot
+  ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)). La cause exacte
+  n'est pas publique : les développeurs de go-librespot pensent à une décision titre par titre
+  liée aux licences (les applications officielles passant par le DRM de Spotify, que SpotiLite ne
+  contourne pas). En cas de refus, SpotiLite réessaie le titre en 160 puis 320 kbit/s (et garde
+  la qualité qui fonctionne) ; un titre refusé dans toutes les qualités est sauté, grisé et non
+  retenté pendant 14 jours (*Réglages → Lecture → Réessayer ces titres* pour forcer un nouvel
+  essai). Si 10 titres d'affilée sont refusés, la lecture s'arrête.
 - **Refus temporaires (`0x0002`) ou absence de réponse** : SpotiLite embarque le correctif
   proposé en amont ([librespot#1763](https://github.com/librespot-org/librespot/pull/1763)) et
   redemande la clé jusqu'à 3 fois, puis se reconnecte une fois avant d'abandonner.
