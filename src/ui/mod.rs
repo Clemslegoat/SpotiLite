@@ -300,7 +300,9 @@ impl App {
                     owner: "demo".into(),
                     total: 40 + i as u32 * 13,
                     snapshot_id: String::new(),
-                    image: None,
+                    image: Some(
+                        ["demo-cover", "demo-artist-0", "demo-artist-1", "demo-artist-2"][i % 4].into(),
+                    ),
                 })
                 .collect();
         // A synthetic cover (dusk gradient) to show the player bar colors.

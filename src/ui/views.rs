@@ -287,16 +287,17 @@ fn home_page(app: &mut App, ui: &mut Ui) {
 /// Tiles to the library and the first playlists.
 fn shortcuts(app: &mut App, ui: &mut Ui) {
     let p = app.palette;
-    let mut shortcuts: Vec<(Icon, String, ViewKey)> = vec![
-        (Icon::Heart { filled: true }, "Titres likés".into(), ViewKey::Liked),
-        (Icon::Disc, "Albums".into(), ViewKey::SavedAlbums),
-        (Icon::Artist, "Artistes".into(), ViewKey::Artists),
+    // Icon, label, page, and the cover of a playlist.
+    let mut shortcuts: Vec<(Icon, String, ViewKey, Option<String>)> = vec![
+        (Icon::Heart { filled: true }, "Titres likés".into(), ViewKey::Liked, None),
+        (Icon::Disc, "Albums".into(), ViewKey::SavedAlbums, None),
+        (Icon::Artist, "Artistes".into(), ViewKey::Artists, None),
     ];
     shortcuts.extend(
         app.playlists
             .iter()
             .take(5)
-            .map(|pl| (Icon::Library, pl.name.clone(), ViewKey::Playlist(pl.id.clone()))),
+            .map(|pl| (Icon::Library, pl.name.clone(), ViewKey::Playlist(pl.id.clone()), pl.image.clone())),
     );
     let gap = 10.0;
     let columns = ((ui.available_width() + gap) / 240.0).floor().clamp(1.0, 4.0) as usize;
@@ -304,12 +305,18 @@ fn shortcuts(app: &mut App, ui: &mut Ui) {
     for row in shortcuts.chunks(columns) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            for (icon, label, view) in row {
+            for (icon, label, view, cover) in row {
                 let (rect, response) = ui.allocate_exact_size(vec2(width, 58.0), Sense::click());
                 let fill = if response.hovered() { p.line } else { p.raised };
                 ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_CARD), fill);
                 let tile = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(42.0, 42.0));
-                let art = if *view == ViewKey::Liked { app.liked_art(&ui.ctx().clone()) } else { None };
+                let art = if *view == ViewKey::Liked {
+                    app.liked_art(&ui.ctx().clone())
+                } else if app.settings.show_covers {
+                    app.cover(cover.as_ref())
+                } else {
+                    None
+                };
                 if art.is_some() {
                     widgets::cover(ui, &p, tile, art, 10);
                 } else {
@@ -1193,8 +1200,13 @@ fn playlist_row(app: &mut App, ui: &mut Ui, playlist: &PlaylistSummary) {
         ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_ROW), p.hover);
     }
     let art = Rect::from_min_size(rect.min + vec2(8.0, 7.0), vec2(44.0, 44.0));
-    ui.painter().rect_filled(art, CornerRadius::same(8), p.raised);
-    widgets::paint_icon(ui.painter(), art.shrink(13.0), Icon::Library, p.dim);
+    let texture = if app.settings.show_covers { app.cover(playlist.image.as_ref()) } else { None };
+    if texture.is_some() {
+        widgets::cover(ui, &p, art, texture, 8);
+    } else {
+        ui.painter().rect_filled(art, CornerRadius::same(8), p.raised);
+        widgets::paint_icon(ui.painter(), art.shrink(13.0), Icon::Library, p.dim);
+    }
     let x = art.right() + 14.0;
     let width = rect.right() - x - 10.0;
     paint_text(ui, pos2(x, rect.center().y - 9.0), &playlist.name, theme::strong_font(14.0), p.text, width);
