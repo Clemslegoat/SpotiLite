@@ -1647,7 +1647,11 @@ impl Core {
             }
             ViewKey::Album(id) => {
                 let key = format!("album-{id}");
-                if !force && let Some(c) = store.load::<CachedAlbum>(&key) {
+                // Albums cached before banners existed lack the larger cover: read them again.
+                if !force
+                    && let Some(c) = store.load::<CachedAlbum>(&key)
+                    && (c.album.cover.is_some() || c.album.image.is_none())
+                {
                     return ui.send(album_event(view, c));
                 }
                 ui.send(Event::Loading(view.clone()));
