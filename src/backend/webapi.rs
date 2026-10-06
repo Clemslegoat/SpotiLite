@@ -24,6 +24,23 @@ use crate::model::{AlbumSummary, ArtistRef, ArtistSummary, PlaylistSummary, Sear
 const API: &str = "https://api.spotify.com/v1";
 /// Safety net against endless pagination.
 const MAX_ITEMS: usize = 20_000;
+/// Releases listed on an artist page. Spotify returns them 10 at a time to
+/// development mode applications (a larger `limit` is refused).
+const ARTIST_RELEASES_MAX: usize = 60;
+const ARTIST_RELEASES_PAGE: usize = 10;
+
+fn artist_albums_url(id: &str) -> String {
+    format!(
+        "{API}/artists/{id}/albums?include_groups=album,single&limit={ARTIST_RELEASES_PAGE}&market=from_token"
+    )
+}
+
+/// What an artist page shows (besides the user's liked tracks of the artist).
+pub struct ArtistDetails {
+    pub name: String,
+    pub image: Option<String>,
+    pub albums: Vec<AlbumSummary>,
+}
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -280,14 +297,25 @@ impl WebApi {
     async fn paged<T>(
         &self,
         first_url: String,
+        convert: impl FnMut(Value) -> Option<T>,
+    ) -> ApiResult<Vec<T>> {
+        self.paged_max(first_url, convert, MAX_ITEMS).await
+    }
+
+    /// Same, stopping once `max` items were collected.
+    async fn paged_max<T>(
+        &self,
+        first_url: String,
         mut convert: impl FnMut(Value) -> Option<T>,
+        max: usize,
     ) -> ApiResult<Vec<T>> {
         let mut out = Vec::new();
         let mut url = Some(first_url);
         while let Some(current) = url.take() {
             let page: Page = self.get(&current).await?;
             out.extend(page.items.into_iter().filter_map(&mut convert));
-            if out.len() >= MAX_ITEMS {
+            if out.len() >= max {
+                out.truncate(max);
                 break;
             }
             url = page.next;
@@ -371,33 +399,12 @@ impl WebApi {
         Ok((summary, tracks))
     }
 
-    pub async fn artist(&self, id: &str) -> ApiResult<(String, Vec<Track>, Vec<AlbumSummary>)> {
-        #[derive(Deserialize)]
-        struct Artist {
-            name: String,
-        }
-        #[derive(Deserialize)]
-        struct TopTracks {
-            #[serde(default)]
-            tracks: Vec<Value>,
-        }
-        let artist: Artist = self.get(&format!("{API}/artists/{id}")).await?;
-        // Not available to development mode applications: optional.
-        let top =
-            match self.get::<TopTracks>(&format!("{API}/artists/{id}/top-tracks?market=from_token")).await {
-                Ok(top) => top.tracks.into_iter().filter_map(|v| track_from(v, None)).collect(),
-                Err(e) => {
-                    log::info!("top tracks unavailable: {e}");
-                    Vec::new()
-                }
-            };
-        let albums = self
-            .paged(
-                format!("{API}/artists/{id}/albums?include_groups=album,single&limit=50&market=from_token"),
-                album_from,
-            )
-            .await?;
-        Ok((artist.name, top, albums))
+    /// An artist's name, picture and releases. Top tracks are not available to
+    /// development mode applications (removed in February 2026).
+    pub async fn artist(&self, id: &str) -> ApiResult<ArtistDetails> {
+        let artist: ArtistJson = self.get(&format!("{API}/artists/{id}")).await?;
+        let albums = self.paged_max(artist_albums_url(id), album_from, ARTIST_RELEASES_MAX).await?;
+        Ok(ArtistDetails { name: artist.name, image: small_image(&artist.images), albums })
     }
 
     /// Artists the user follows, sorted by name (cursor pagination).
@@ -631,7 +638,7 @@ struct ArtistJson {
 }
 
 fn artist_summary(artist: ArtistJson) -> Option<ArtistSummary> {
-    Some(ArtistSummary { id: artist.id?, name: artist.name, image: small_image(&artist.images) })
+    Some(ArtistSummary { id: artist.id?, name: artist.name, image: small_image(&artist.images), liked: 0 })
 }
 
 #[derive(Deserialize)]
@@ -770,6 +777,15 @@ mod tests {
         let artist = artist_summary(serde_json::from_value(json).unwrap()).unwrap();
         assert_eq!(artist.image.as_deref(), Some("small"));
         assert!(artist_summary(serde_json::from_value(json!({"name": "no id"})).unwrap()).is_none());
+    }
+
+    #[test]
+    fn artist_releases_are_asked_ten_at_a_time() {
+        // Development mode applications get "Invalid limit" above 10.
+        let url = reqwest::Url::parse(&artist_albums_url("a1")).unwrap();
+        let limit = url.query_pairs().find(|(k, _)| k == "limit").unwrap().1;
+        assert!(limit.parse::<u32>().unwrap() <= 10);
+        assert!(url.path().ends_with("/artists/a1/albums"));
     }
 
     #[test]

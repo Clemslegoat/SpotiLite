@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::config::{Paths, Settings};
-use crate::model::{AlbumSummary, ArtistSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
+use crate::model::{
+    AlbumSummary, ArtistSummary, ArtistsPage, PlaylistSummary, Repeat, SearchResults, Track, ViewKey,
+    artists_by_count,
+};
 use crate::queue::Queue;
 pub use auth::AppCredentials;
 use auth::{AuthFlow, OAuthToken};
@@ -132,12 +135,15 @@ pub enum Event {
         title: String,
         albums: Vec<AlbumSummary>,
     },
-    /// Artists the user follows.
-    FollowedArtists(Vec<ArtistSummary>),
+    Artists(ArtistsPage),
+    /// An authorization was accepted again (new scopes).
+    Authorized,
     Artist {
         id: String,
         name: String,
-        top: Arc<Vec<Track>>,
+        image: Option<String>,
+        /// The user's liked tracks by this artist.
+        liked: Arc<Vec<Track>>,
         albums: Vec<AlbumSummary>,
     },
     Search(SearchResults),
@@ -272,8 +278,33 @@ struct CachedAlbum {
 struct CachedArtist {
     saved_at: u64,
     name: String,
-    top: Vec<Track>,
+    #[serde(default)]
+    image: Option<String>,
     albums: Vec<AlbumSummary>,
+}
+
+/// Artists of the liked tracks shown under the followed ones.
+const LIBRARY_ARTISTS: usize = 36;
+
+fn liked_cache(store: &Store) -> Vec<Track> {
+    store.load::<CachedTracks>("liked").map(|c| c.tracks).unwrap_or_default()
+}
+
+fn artists_page(
+    liked: &[Track],
+    followed: Vec<ArtistSummary>,
+    problem: Option<String>,
+    needs_auth: bool,
+) -> ArtistsPage {
+    let library = artists_by_count(liked, &followed, LIBRARY_ARTISTS);
+    ArtistsPage { followed, library, problem, needs_auth }
+}
+
+/// The user's liked tracks by an artist (no request: from the cache).
+fn liked_by(store: &Store, artist: &str) -> Arc<Vec<Track>> {
+    let mut tracks = liked_cache(store);
+    tracks.retain(|t| t.artists.iter().any(|a| a.id == artist));
+    Arc::new(tracks)
 }
 
 /// Bitrate assumed when the engine's traffic cannot be measured.
@@ -731,6 +762,8 @@ impl Core {
                         self.ui.send(Event::Info("Application Spotify connectée.".into()));
                         if first {
                             self.after_connect();
+                        } else {
+                            self.ui.send(Event::Authorized);
                         }
                         if resume && !self.playing {
                             // The play that needed the new authorization.
@@ -1518,9 +1551,12 @@ impl Core {
                 });
             }
             ViewKey::Artists => {
+                // The artists of the liked tracks are always shown: the page is
+                // never empty, even when followed artists cannot be read.
+                let liked = liked_cache(&store);
                 let cached = store.load::<Vec<ArtistSummary>>("artists");
-                if let Some(artists) = &cached {
-                    ui.send(Event::FollowedArtists(artists.clone()));
+                if let Some(followed) = &cached {
+                    ui.send(Event::Artists(artists_page(&liked, followed.clone(), None, false)));
                     if self.fresh(&view, Duration::from_secs(1800), force) {
                         return;
                     }
@@ -1528,26 +1564,33 @@ impl Core {
                     self.fresh(&view, Duration::ZERO, true);
                     ui.send(Event::Loading(view.clone()));
                 }
-                let internal = self.internal.clone();
                 tokio::spawn(async move {
-                    match api.followed_artists().await {
-                        Ok(artists) => {
-                            if cached.as_ref() != Some(&artists) {
-                                store.save("artists", &artists);
-                                ui.send(Event::FollowedArtists(artists));
+                    let page = match api.followed_artists().await {
+                        Ok(followed) => {
+                            if cached.as_ref() == Some(&followed) {
+                                return;
                             }
+                            store.save("artists", &followed);
+                            artists_page(&liked, followed, None, false)
                         }
                         // Authorizations given before this page existed lack the scope.
-                        Err(e) if e.is_missing_scope() => {
-                            let _ = internal.send(Internal::Scopes(vec!["user-follow-read"], true));
-                            ui.send(Event::ViewFailed {
-                                view,
-                                message: "Autorisez SpotiLite à lire vos artistes suivis (le navigateur s'ouvre), puis réessayez."
-                                    .into(),
-                            });
+                        Err(e) if e.is_missing_scope() => artists_page(
+                            &liked,
+                            cached.unwrap_or_default(),
+                            Some("Autorisez SpotiLite à lire les artistes que vous suivez.".into()),
+                            true,
+                        ),
+                        Err(e) => {
+                            log::warn!("followed artists: {e}");
+                            artists_page(
+                                &liked,
+                                cached.unwrap_or_default(),
+                                Some(format!("Artistes suivis indisponibles pour le moment ({e}).")),
+                                false,
+                            )
                         }
-                        Err(e) => ui.send(Event::ViewFailed { view, message: e.to_string() }),
-                    }
+                    };
+                    ui.send(Event::Artists(page));
                 });
             }
             ViewKey::Playlist(id) => {
@@ -1614,6 +1657,7 @@ impl Core {
             }
             ViewKey::Artist(id) => {
                 let key = format!("artist-{id}");
+                let liked = liked_by(&store, &id);
                 if !force
                     && let Some(c) = store.load::<CachedArtist>(&key)
                     && now_secs().saturating_sub(c.saved_at) < 86_400
@@ -1621,24 +1665,26 @@ impl Core {
                     return ui.send(Event::Artist {
                         id,
                         name: c.name,
-                        top: Arc::new(c.top),
+                        image: c.image,
+                        liked,
                         albums: c.albums,
                     });
                 }
                 ui.send(Event::Loading(view.clone()));
                 tokio::spawn(async move {
                     match api.artist(&id).await {
-                        Ok((name, top, albums)) => {
+                        Ok(artist) => {
                             store.save(
                                 &key,
                                 &CachedArtist {
                                     saved_at: now_secs(),
-                                    name: name.clone(),
-                                    top: top.clone(),
-                                    albums: albums.clone(),
+                                    name: artist.name.clone(),
+                                    image: artist.image.clone(),
+                                    albums: artist.albums.clone(),
                                 },
                             );
-                            ui.send(Event::Artist { id, name, top: Arc::new(top), albums });
+                            let (name, image, albums) = (artist.name, artist.image, artist.albums);
+                            ui.send(Event::Artist { id, name, image, liked, albums });
                         }
                         Err(e) => ui.send(Event::ViewFailed { view, message: e.to_string() }),
                     }
@@ -1681,7 +1727,21 @@ impl Core {
                 ViewKey::SavedAlbums => store
                     .load::<Vec<AlbumSummary>>("albums")
                     .map(|albums| Event::Albums { view: view.clone(), title: "Albums".into(), albums }),
-                ViewKey::Artists => store.load::<Vec<ArtistSummary>>("artists").map(Event::FollowedArtists),
+                ViewKey::Artists => Some(Event::Artists(artists_page(
+                    &liked_cache(store),
+                    store.load::<Vec<ArtistSummary>>("artists").unwrap_or_default(),
+                    None,
+                    false,
+                ))),
+                ViewKey::Artist(id) => {
+                    store.load::<CachedArtist>(&format!("artist-{id}")).map(|c| Event::Artist {
+                        liked: liked_by(store, id),
+                        id: id.clone(),
+                        name: c.name,
+                        image: c.image,
+                        albums: c.albums,
+                    })
+                }
                 ViewKey::Playlist(id) => store.load::<CachedTracks>(&format!("playlist-{id}")).map(|c| {
                     let summary = self.playlists.get(id);
                     Event::Tracks {

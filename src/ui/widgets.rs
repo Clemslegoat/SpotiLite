@@ -5,7 +5,7 @@ use std::f32::consts::PI;
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Margin, Pos2, Rect, Response, Sense, Shape,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Margin, Pos2, Rect, Response, Sense, Shape,
     Stroke, Ui, Vec2, pos2, vec2,
 };
 
@@ -369,18 +369,6 @@ pub fn pill_with_icon(ui: &mut Ui, p: &Palette, icon: Option<Icon>, label: &str,
     response
 }
 
-/// Rounded label chip (artists in search results).
-pub fn chip(ui: &mut Ui, p: &Palette, label: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), theme::body_font(), Color32::PLACEHOLDER);
-    let size = vec2(galley.size().x + 26.0, 32.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let response = response.on_hover_cursor(CursorIcon::PointingHand);
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(16), if response.hovered() { p.line } else { p.raised });
-    painter.galley(rect.center() - galley.size() * 0.5, galley, p.text);
-    response
-}
-
 /// Pill-shaped text field with a leading icon (search, filter).
 pub fn search_field(
     ui: &mut Ui,
@@ -503,6 +491,113 @@ pub fn cover(ui: &Ui, p: &Palette, rect: Rect, texture: Option<egui::TextureId>,
             paint_icon(ui.painter(), rect.shrink(rect.width() * 0.3), Icon::Disc, p.faint);
         }
     }
+}
+
+/// Round portrait, or the initials on a dark disc while there is no picture.
+pub fn avatar(ui: &Ui, p: &Palette, rect: Rect, texture: Option<egui::TextureId>, name: &str) {
+    let radius = rect.width().min(rect.height()) * 0.5;
+    if texture.is_some() {
+        return cover(ui, p, rect, texture, radius.min(255.0) as u8);
+    }
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), radius, initials_tint(name));
+    let initials: String = name
+        .split_whitespace()
+        .filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    // A few fixed sizes only: each font size is rasterized separately.
+    let size = ((radius * 0.44) / 4.0).round().max(3.0) * 4.0;
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        initials,
+        theme::strong_font(size),
+        Color32::from_gray(0xe6),
+    );
+}
+
+/// A deep, muted color picked from the name: avatars without a picture are told
+/// apart at a glance, without breaking the black and white theme.
+fn initials_tint(name: &str) -> Color32 {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let hue = (hash % 360) as f32 / 60.0;
+    let (s, v) = (0.38, 0.30);
+    let c = v * s;
+    let x = c * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let channel = |f: f32| ((f + m) * 255.0) as u8;
+    Color32::from_rgb(channel(r), channel(g), channel(b))
+}
+
+/// Segmented control: one choice per segment, the selected one in white.
+/// Returns the index clicked.
+pub fn segmented(ui: &mut Ui, p: &Palette, labels: &[&str], selected: Option<usize>) -> Option<usize> {
+    let font = theme::strong_font(13.0);
+    let (height, inset) = (32.0, 3.0);
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|label| {
+            ui.painter().layout_no_wrap(label.to_string(), font.clone(), Color32::PLACEHOLDER).size().x + 28.0
+        })
+        .collect();
+    let total = widths.iter().sum::<f32>() + inset * 2.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(total, height), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same((height * 0.5) as u8), p.line);
+    let mut clicked = None;
+    let mut x = rect.left() + inset;
+    for (i, (label, width)) in labels.iter().zip(&widths).enumerate() {
+        let segment = Rect::from_min_size(pos2(x, rect.top() + inset), vec2(*width, height - inset * 2.0));
+        let response = ui
+            .interact(segment, Id::new(("segment", labels[0], i)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let on = selected == Some(i);
+        let radius = CornerRadius::same(((height - inset * 2.0) * 0.5) as u8);
+        if on {
+            painter.rect_filled(segment, radius, p.accent);
+        } else if response.hovered() {
+            painter.rect_filled(segment, radius, Color32::from_white_alpha(18));
+        }
+        let color = if on { p.on_accent } else { p.text };
+        painter.text(segment.center(), Align2::CENTER_CENTER, *label, font.clone(), color);
+        if response.clicked() {
+            clicked = Some(i);
+        }
+        x += width;
+    }
+    clicked
+}
+
+/// On/off switch; returns true when it was flipped.
+pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(42.0, 24.0), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    if response.clicked() {
+        *on = !*on;
+    }
+    let painter = ui.painter();
+    let track = if *on {
+        p.accent
+    } else if response.hovered() {
+        Color32::from_gray(0x3a)
+    } else {
+        p.line
+    };
+    painter.rect_filled(rect, CornerRadius::same(12), track);
+    let knob_x = if *on { rect.right() - 12.0 } else { rect.left() + 12.0 };
+    let knob = if *on { p.on_accent } else { p.text };
+    painter.circle_filled(pos2(knob_x, rect.center().y), 8.5, knob);
+    response.clicked()
 }
 
 pub fn format_duration(ms: u32) -> String {

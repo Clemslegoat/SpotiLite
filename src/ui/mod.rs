@@ -18,7 +18,9 @@ use egui::{Key, Modifiers, TextureHandle, TextureOptions};
 use crate::backend::{AppState, AppStatus, Backend, Command, Event};
 use crate::config::{Paths, Settings};
 use crate::media::MediaKeys;
-use crate::model::{AlbumSummary, ArtistSummary, PlaylistSummary, Repeat, SearchResults, Track, ViewKey};
+use crate::model::{
+    AlbumSummary, ArtistSummary, ArtistsPage, PlaylistSummary, Repeat, SearchResults, Track, ViewKey,
+};
 use crate::sys;
 use theme::Palette;
 
@@ -28,8 +30,8 @@ const MAX_PAGES: usize = 12;
 const MAX_TEXTURES: usize = 48;
 
 pub enum Page {
-    /// Artists the user follows.
-    Artists(Vec<ArtistSummary>),
+    /// Followed artists, then the artists of the liked tracks.
+    Artists(ArtistsPage),
     Tracks {
         title: String,
         subtitle: String,
@@ -48,7 +50,9 @@ pub enum Page {
     },
     Artist {
         name: String,
-        top: Arc<Vec<Track>>,
+        image: Option<String>,
+        /// The user's liked tracks by this artist.
+        liked: Arc<Vec<Track>>,
         albums: Vec<AlbumSummary>,
     },
     Search(SearchResults),
@@ -113,8 +117,15 @@ struct Covers {
     tints: HashMap<String, ambient::Tint>,
     order: VecDeque<String>,
     requested: HashSet<String>,
-    /// Blurred gradient of the current cover (url, texture).
-    ambient: Option<(String, TextureHandle)>,
+    /// Blurred gradients (url, texture): the player bar's and the page banner's.
+    ambient: [Option<(String, TextureHandle)>; 2],
+}
+
+/// Which blurred gradient: each place keeps its own.
+#[derive(Clone, Copy)]
+pub enum Ambient {
+    Player = 0,
+    Banner = 1,
 }
 
 pub struct App {
@@ -243,7 +254,9 @@ impl App {
                 album: format!("Album {}", i % 9 + 1),
                 album_id: format!("al{}", i % 9),
                 duration_ms: 150_000 + (i as u32 * 7919) % 120_000,
-                image: None,
+                image: Some(
+                    ["demo-cover", "demo-artist-0", "demo-artist-1", "demo-artist-2"][i % 9 % 4].into(),
+                ),
                 playable: i % 17 != 16,
             })
             .collect();
@@ -294,21 +307,77 @@ impl App {
         self.view = ViewKey::Liked;
         self.pages.insert(
             ViewKey::Liked,
-            Page::Tracks { title: "Titres likés".into(), subtitle: String::new(), tracks: Arc::new(tracks) },
+            Page::Tracks {
+                title: "Titres likés".into(),
+                subtitle: String::new(),
+                tracks: Arc::new(tracks.clone()),
+            },
         );
         self.engine_status = "Prêt · DRM Widevine".into();
         self.engine_memory = 112 * 1024 * 1024;
-        let followed = ["Atlas Sud", "Kaito", "Les Ondes", "Mélodie Brune", "Nora Vale"]
+        // Artists: three portraits (synthetic gradients), the rest with initials.
+        let portrait = |ctx: &egui::Context, covers: &mut Covers, i: usize| {
+            let key = format!("demo-artist-{i}");
+            let hue = [(210.0, 120.0, 90.0), (80.0, 140.0, 200.0), (150.0, 90.0, 190.0)][i % 3];
+            let image = egui::ColorImage::new(
+                [64, 64],
+                (0..64 * 64)
+                    .map(|p| {
+                        let (x, y) = ((p % 64) as f32 / 63.0 - 0.5, (p / 64) as f32 / 63.0 - 0.35);
+                        let light = (1.0 - (x * x + y * y).sqrt() * 1.6).clamp(0.25, 1.0);
+                        egui::Color32::from_rgb(
+                            (hue.0 * light) as u8,
+                            (hue.1 * light) as u8,
+                            (hue.2 * light) as u8,
+                        )
+                    })
+                    .collect(),
+            );
+            covers.tints.insert(key.clone(), ambient::tint_of(&image));
+            covers.textures.insert(key.clone(), ctx.load_texture(key.clone(), image, TextureOptions::LINEAR));
+            key
+        };
+        let followed: Vec<ArtistSummary> = ["Atlas Sud", "Kaito", "Les Ondes"]
             .iter()
             .enumerate()
-            .map(|(i, name)| ArtistSummary { id: format!("a{i}"), name: (*name).into(), image: None })
+            .map(|(i, name)| ArtistSummary {
+                id: format!("f{i}"),
+                name: (*name).into(),
+                image: Some(portrait(ctx, &mut self.covers, i)),
+                liked: 0,
+            })
             .collect();
-        self.pages.insert(ViewKey::Artists, Page::Artists(followed));
+        let library = crate::model::artists_by_count(&tracks, &followed, 36);
+        self.pages.insert(
+            ViewKey::Artists,
+            Page::Artists(ArtistsPage { followed, library, problem: None, needs_auth: false }),
+        );
+        let liked: Vec<Track> = tracks.iter().filter(|t| t.artists[0].id == "a2").take(6).cloned().collect();
+        let albums = (0..7)
+            .map(|i| AlbumSummary {
+                id: format!("al{i}"),
+                name: ["Rivages", "Marées", "Phares", "Écume", "Brise", "Sable", "Vagues"][i].into(),
+                artists: "Kaito".into(),
+                year: format!("{}", 2025 - i * 2),
+                total_tracks: 6 + i as u32 * 2,
+                image: if i == 0 { Some("demo-cover".into()) } else { None },
+            })
+            .collect();
+        self.pages.insert(
+            ViewKey::Artist("a2".into()),
+            Page::Artist {
+                name: "Kaito".into(),
+                image: Some(portrait(ctx, &mut self.covers, 1)),
+                liked: Arc::new(liked),
+                albums,
+            },
+        );
         if let Ok(view) = std::env::var("SPOTILITE_DEMO_VIEW") {
             self.view = match view.as_str() {
                 "settings" => ViewKey::Settings,
                 "queue" => ViewKey::Queue,
                 "artists" => ViewKey::Artists,
+                "artist" => ViewKey::Artist("a2".into()),
                 _ => ViewKey::Liked,
             };
             self.history.push(ViewKey::Liked);
@@ -405,9 +474,18 @@ impl App {
                 self.store_page(view, Page::Context { title, subtitle, uri, total });
             }
             Event::Albums { view, title, albums } => self.store_page(view, Page::Albums { title, albums }),
-            Event::FollowedArtists(artists) => self.store_page(ViewKey::Artists, Page::Artists(artists)),
-            Event::Artist { id, name, top, albums } => {
-                self.store_page(ViewKey::Artist(id), Page::Artist { name, top, albums });
+            Event::Artists(page) => self.store_page(ViewKey::Artists, Page::Artists(page)),
+            Event::Artist { id, name, image, liked, albums } => {
+                self.store_page(ViewKey::Artist(id), Page::Artist { name, image, liked, albums });
+            }
+            Event::Authorized => {
+                // What waited for the new authorization loads now.
+                let waiting =
+                    matches!(self.pages.get(&self.view), Some(Page::Artists(page)) if page.needs_auth);
+                if waiting || self.failures.contains_key(&self.view) {
+                    self.failures.remove(&self.view);
+                    self.send(Command::Open { view: self.view.clone(), force: true });
+                }
             }
             Event::Search(results) => {
                 self.store_page(ViewKey::Search(results.query.clone()), Page::Search(results));
@@ -481,24 +559,30 @@ impl App {
     }
 
     /// Blurred gradient of the current track's cover, for the player bar.
-    fn ambient(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+    fn player_ambient(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
         let url = self.player.now.as_ref()?.image.clone()?;
+        self.ambient(ctx, &url, Ambient::Player)
+    }
+
+    /// Blurred gradient made from the image at `url` (once it is loaded).
+    fn ambient(&mut self, ctx: &egui::Context, url: &String, slot: Ambient) -> Option<egui::TextureId> {
         if !self.settings.show_covers {
             return None;
         }
-        if let Some((current, texture)) = &self.covers.ambient
-            && *current == url
+        if let Some((current, texture)) = &self.covers.ambient[slot as usize]
+            && current == url
         {
             return Some(texture.id());
         }
-        let Some(tint) = self.covers.tints.get(&url) else {
-            // Arrives with the cover itself.
-            self.cover(Some(&url));
+        let Some(tint) = self.covers.tints.get(url) else {
+            // Arrives with the image itself.
+            self.cover(Some(url));
             return None;
         };
-        let texture = ctx.load_texture("ambient", ambient::ambient_image(tint), TextureOptions::LINEAR);
+        let name = format!("ambient-{}", slot as usize);
+        let texture = ctx.load_texture(name, ambient::ambient_image(tint), TextureOptions::LINEAR);
         let id = texture.id();
-        self.covers.ambient = Some((url, texture));
+        self.covers.ambient[slot as usize] = Some((url.clone(), texture));
         Some(id)
     }
 
@@ -506,6 +590,13 @@ impl App {
     fn cover(&mut self, url: Option<&String>) -> Option<egui::TextureId> {
         let url = url?;
         if let Some(texture) = self.covers.textures.get(url) {
+            // Most recently used last: what is on screen is evicted last.
+            if self.covers.order.back() != Some(url)
+                && let Some(i) = self.covers.order.iter().position(|u| u == url)
+            {
+                let used = self.covers.order.remove(i).unwrap_or_default();
+                self.covers.order.push_back(used);
+            }
             return Some(texture.id());
         }
         if self.settings.show_covers && self.covers.requested.insert(url.clone()) {
@@ -657,7 +748,7 @@ impl App {
     fn visible_tracks(&mut self) -> Option<Arc<Vec<Track>>> {
         let tracks = match self.pages.get(&self.view)? {
             Page::Tracks { tracks, .. } => tracks.clone(),
-            Page::Artist { top, .. } => top.clone(),
+            Page::Artist { liked, .. } => liked.clone(),
             Page::Search(results) => results.tracks.clone(),
             Page::Albums { .. } | Page::Artists(_) | Page::Context { .. } => return None,
         };
@@ -697,7 +788,7 @@ impl App {
             self.covers.tints.clear();
             self.covers.order.clear();
             self.covers.requested.clear();
-            self.covers.ambient = None;
+            self.covers.ambient = Default::default();
             sys::trim_working_set();
         }
         self.minimized = minimized;

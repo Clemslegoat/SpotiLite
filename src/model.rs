@@ -36,6 +36,31 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The artists of `tracks`, those with the most tracks first (at most `max`,
+/// leaving out `skip`). Needs no request: it works from the liked tracks cache.
+pub fn artists_by_count(tracks: &[Track], skip: &[ArtistSummary], max: usize) -> Vec<ArtistSummary> {
+    let mut counts: std::collections::HashMap<&str, (u32, &str)> = std::collections::HashMap::new();
+    for artist in tracks.iter().flat_map(|t| &t.artists) {
+        if !artist.id.is_empty() {
+            counts.entry(&artist.id).or_insert((0, &artist.name)).0 += 1;
+        }
+    }
+    let mut artists: Vec<_> = counts
+        .into_iter()
+        .filter(|(id, _)| !skip.iter().any(|s| s.id == *id))
+        .map(|(id, (liked, name))| ArtistSummary { id: id.into(), name: name.into(), image: None, liked })
+        .collect();
+    artists.sort_by(|a, b| {
+        b.liked.cmp(&a.liked).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    artists.truncate(max);
+    artists
+}
+
 impl Track {
     pub fn artists_joined(&self) -> String {
         join_names(self.artists.iter().map(|a| a.name.as_str()))
@@ -70,6 +95,21 @@ pub struct ArtistSummary {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Number of the user's liked tracks by this artist (0 when not counted).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub liked: u32,
+}
+
+/// What the Artists page shows.
+#[derive(Clone, Debug, Default)]
+pub struct ArtistsPage {
+    pub followed: Vec<ArtistSummary>,
+    /// Artists of the liked tracks that are not followed, most liked first.
+    pub library: Vec<ArtistSummary>,
+    /// Why followed artists could not be read, if they could not.
+    pub problem: Option<String>,
+    /// The authorization must be renewed to read followed artists.
+    pub needs_auth: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,5 +190,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.artists_joined(), "A, B");
+    }
+
+    #[test]
+    fn counts_artists_of_liked_tracks() {
+        let track = |ids: &[&str]| Track {
+            artists: ids.iter().map(|id| ArtistRef { id: id.to_string(), name: id.to_uppercase() }).collect(),
+            ..Default::default()
+        };
+        let tracks =
+            [track(&["b"]), track(&["a", "b"]), track(&["c"]), track(&["a"]), track(&["b"]), track(&[""])];
+        let followed = [ArtistSummary { id: "c".into(), ..Default::default() }];
+        let artists = artists_by_count(&tracks, &followed, 10);
+        let summary: Vec<_> = artists.iter().map(|a| (a.name.as_str(), a.liked)).collect();
+        assert_eq!(summary, [("B", 3), ("A", 2)]);
+        assert_eq!(artists_by_count(&tracks, &[], 1).len(), 1);
     }
 }

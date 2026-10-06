@@ -54,7 +54,7 @@ pub const RADIUS_ROW: u8 = 10;
 pub const GAP: i8 = 8;
 
 pub const ROW_HEIGHT: f32 = 46.0;
-pub const PLAYER_HEIGHT: f32 = 116.0;
+pub const PLAYER_HEIGHT: f32 = 88.0;
 pub const SIDEBAR_WIDTH: f32 = 236.0;
 
 pub fn heading_font() -> FontId {

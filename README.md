@@ -100,10 +100,15 @@ partager les limites de requêtes avec d'autres utilisateurs.
 **J'écoute avec un autre compte que celui qui a créé l'application.** Ajoutez ce compte dans
 **User Management** sur la page de votre application Spotify.
 
-**Certaines playlists ou pages d'artistes ne montrent pas leurs titres.** Spotify ne donne pas le
-contenu des playlists des autres utilisateurs, ni les titres populaires des artistes, aux
-applications personnelles. SpotiLite les fait alors lire directement par Spotify : les titres
-s'affichent au fil de la lecture et la file d'attente montre les suivants.
+**Certaines playlists ne montrent pas leurs titres.** Spotify ne donne pas le contenu des
+playlists des autres utilisateurs aux applications personnelles. SpotiLite les fait alors lire
+directement par Spotify : les titres s'affichent au fil de la lecture et la file d'attente montre
+les suivants.
+
+**Pourquoi la page d'un artiste n'a pas ses « titres populaires » ?** Spotify ne les donne plus
+aux applications personnelles. La page montre à la place vos titres likés de cet artiste et sa
+discographie, et le bouton ▶ fait jouer ses titres populaires par Spotify. La page *Artistes*
+montre les artistes que vous suivez et ceux qui reviennent le plus dans vos titres likés.
 
 **Spotify me redemande une autorisation.** Une nouvelle version peut avoir besoin d'une
 permission en plus (par exemple pour les artistes suivis) : cliquez sur *Réglages → Compte →
