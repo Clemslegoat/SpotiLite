@@ -1538,9 +1538,6 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
         });
 
         card(ui, &p, "Mémoire et données", |ui| {
-            option_row(ui, &p, "Utilisée", |ui| {
-                ui.label(RichText::new(human_bytes(app.total_memory())).color(p.text));
-            });
             option_row(ui, &p, "Libérer quand réduite", |ui| {
                 changed |= widgets::toggle(ui, &p, &mut app.settings.trim_when_minimized);
             });
