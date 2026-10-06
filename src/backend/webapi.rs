@@ -335,6 +335,13 @@ impl WebApi {
         Ok((me.id, name))
     }
 
+    /// Removes a track (all its occurrences) from one of the user's playlists.
+    pub async fn remove_from_playlist(&self, playlist_id: &str, track_id: &str) -> ApiResult<()> {
+        let body = serde_json::json!({ "items": [{ "uri": format!("spotify:track:{track_id}") }] });
+        let url = format!("{API}/playlists/{playlist_id}/items");
+        self.request_with(Method::DELETE, &url, Some(&body)).await.map(drop)
+    }
+
     /// Adds a track at the end of one of the user's playlists.
     pub async fn add_to_playlist(&self, playlist_id: &str, track_id: &str) -> ApiResult<()> {
         let body = serde_json::json!({ "uris": [format!("spotify:track:{track_id}")] });

@@ -1,21 +1,20 @@
-**Réservé aux abonnés Spotify Premium.** Windows 10 / 11, 64 bits.
+**Spotify Premium required.** Windows 10 / 11, 64-bit.
 
-### Télécharger
+### Download
 
-- **`SpotiLite.exe`** : l'application, à lancer directement (rien à installer).
-- `SpotiLite-windows-x64.zip` : la même chose, avec le mode d'emploi.
+- **`SpotiLite.exe`**: the application, run it directly (nothing to install).
+- `SpotiLite-windows-x64.zip`: the same, with the README and the license.
 
-Au premier lancement, SpotiLite vous guide pour créer votre application Spotify (2 minutes,
-une seule fois). Le mode d'emploi complet est sur la [page du projet](https://github.com/Clemslegoat/SpotiLite#readme).
+On first launch, SpotiLite guides you through creating your Spotify developer app (two minutes,
+once). See the [README](https://github.com/Clemslegoat/SpotiLite#readme) for details.
 
-Si Windows affiche « Windows a protégé votre ordinateur » : *Informations complémentaires* →
-*Exécuter quand même* (l'exécutable n'est pas signé).
+The executable is not code-signed: if SmartScreen warns, choose *More info* → *Run anyway*.
 
-### Nouveautés de la 0.2
+### What's in 0.2
 
-- Lecture par le lecteur officiel de Spotify : tous les titres de votre abonnement se lisent.
-- Interface arrondie, barre de lecture aux couleurs de la pochette, boutons plus grands.
-- Page d'**accueil** avec vos dernières écoutes, page **Artistes** dans le menu.
-- Réglages simplifiés.
-- Beaucoup moins de mémoire : environ 6 Mo pour l'interface, et le lecteur se met en veille
-  après 5 minutes de pause.
+- Playback through Spotify's official Web Playback SDK (hidden WebView2): every track of a Premium
+  subscription plays.
+- CPU-rendered interface (no GPU driver), lean player profile that sleeps after 5 minutes of pause.
+- Home page with recently played tracks, followed artists, artist pages, cover-colored headers and
+  player bar, custom title bar, redrawn icons.
+- Queue editing, add to / remove from your playlists, media keys and Windows media flyout.

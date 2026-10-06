@@ -81,6 +81,11 @@ pub enum Command {
         playlist_name: String,
         track: Track,
     },
+    RemoveFromPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        track: Track,
+    },
     SetLiked {
         track: Track,
         liked: bool,
@@ -282,6 +287,8 @@ enum Internal {
     CheckFollowed(u64, bool),
     /// A playlist changed (its summary is read again).
     PlaylistsChanged,
+    /// A track was removed from a playlist (playlist id, track id).
+    RemovedFromPlaylist(String, String),
     /// Playback scopes missing from the authorization (`.1`: the browser may be opened).
     Scopes(Vec<&'static str>, bool),
     TokenFailed(String),
@@ -548,7 +555,31 @@ impl Core {
         if let Some(liked) = self.store.load::<CachedTracks>("liked") {
             self.liked_ids = Some(liked.tracks.into_iter().map(|t| t.id).collect());
         }
+        self.preload_liked();
         self.check_playback_scopes(false);
+    }
+
+    /// Reads the liked tracks in the background (only the first page when the
+    /// cache is up to date): the artist pages and the Artists page use them.
+    fn preload_liked(&self) {
+        let Some(api) = self.api() else { return };
+        let (store, internal) = (self.store.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            let cached = store.load::<CachedTracks>("liked");
+            let previous = cached.as_ref().map(|c| c.tracks.as_slice());
+            match api.liked_tracks(previous).await {
+                Ok(tracks) => {
+                    let _ = internal.send(Internal::LikedIds(tracks.iter().map(|t| t.id.clone()).collect()));
+                    if previous != Some(tracks.as_slice()) {
+                        store.save(
+                            "liked",
+                            &CachedTracks { snapshot: String::new(), saved_at: now_secs(), tracks },
+                        );
+                    }
+                }
+                Err(e) => log::info!("liked tracks not preloaded: {e}"),
+            }
+        });
     }
 
     // ----------------------------------------------------------------------
@@ -613,6 +644,42 @@ impl Core {
                 store.save("profile", &UserProfile { id: id.clone(), name: name.clone() });
                 ui.send(Event::LoggedIn { user: name, id });
             }
+        });
+    }
+
+    fn remove_from_playlist(&self, playlist_id: String, playlist_name: String, track: Track) {
+        let Some(api) = self.api() else { return };
+        let (ui, internal) = (self.ui.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            match api.remove_from_playlist(&playlist_id, &track.id).await {
+                Ok(()) => {
+                    ui.send(Event::Info(format!("« {} » retiré de « {playlist_name} »", track.name)));
+                    let _ = internal.send(Internal::RemovedFromPlaylist(playlist_id, track.id));
+                }
+                Err(e) if e.is_missing_scope() => {
+                    let _ = internal.send(Internal::Scopes(vec!["playlist-modify-private"], true));
+                }
+                Err(ApiError::Forbidden(_)) => ui.error("Spotify refuse de modifier cette playlist."),
+                Err(e) => ui.error(format!("Retrait de « {playlist_name} » impossible : {e}")),
+            }
+        });
+    }
+
+    /// The page of a playlist without a removed track, at once (the cache too).
+    fn drop_from_playlist_cache(&self, playlist_id: &str, track_id: &str) {
+        let key = format!("playlist-{playlist_id}");
+        let Some(mut cached) = self.store.load::<CachedTracks>(&key) else { return };
+        cached.tracks.retain(|t| t.id != track_id);
+        // The playlist's snapshot changed: the next opening reads it again from Spotify.
+        cached.snapshot.clear();
+        self.store.save(&key, &cached);
+        let summary = self.playlists.get(playlist_id);
+        self.ui.send(Event::Tracks {
+            view: ViewKey::Playlist(playlist_id.to_string()),
+            title: summary.map(|p| p.name.clone()).unwrap_or_default(),
+            subtitle: summary.map(|p| p.owner.clone()).unwrap_or_default(),
+            cover: summary.and_then(|p| p.image.clone()),
+            tracks: Arc::new(cached.tracks),
         });
     }
 
@@ -810,6 +877,9 @@ impl Core {
             Command::AddToPlaylist { playlist_id, playlist_name, track } => {
                 self.add_to_playlist(playlist_id, playlist_name, track);
             }
+            Command::RemoveFromPlaylist { playlist_id, playlist_name, track } => {
+                self.remove_from_playlist(playlist_id, playlist_name, track);
+            }
             Command::SetLiked { track, liked } => self.set_liked(track, liked),
             Command::FetchImage(url) => self.fetch_image(url),
             Command::ApplySettings(settings) => self.apply_settings(*settings),
@@ -853,6 +923,10 @@ impl Core {
             }
             Internal::CheckFollowed(control, playing) => self.ensure_followed(control, playing),
             Internal::PlaylistsChanged => self.load_playlists(),
+            Internal::RemovedFromPlaylist(playlist_id, track_id) => {
+                self.drop_from_playlist_cache(&playlist_id, &track_id);
+                self.load_playlists();
+            }
             Internal::SkipAfterFailure(generation) => {
                 if generation == self.load_generation {
                     self.skip(false);

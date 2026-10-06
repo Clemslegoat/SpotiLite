@@ -1,206 +1,217 @@
-<img src="assets/spotilite-256.png" alt="Logo de SpotiLite" width="96">
+<div align="center">
+
+<img src="assets/spotilite-256.png" alt="SpotiLite logo" width="112">
 
 # SpotiLite
 
-**Écoutez Spotify sur Windows avec une application légère, sobre et rapide.**
+**A lightweight native Spotify client for Windows, written in Rust.**
 
-> ⚠️ **Réservé aux abonnés Spotify Premium.** SpotiLite utilise le lecteur officiel de Spotify,
-> qui ne fonctionne qu'avec un compte Premium. Un compte gratuit ne pourra pas lire de musique.
+[![Build](https://img.shields.io/github/actions/workflow/status/Clemslegoat/SpotiLite/build.yml?label=build)](https://github.com/Clemslegoat/SpotiLite/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/Clemslegoat/SpotiLite)](https://github.com/Clemslegoat/SpotiLite/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)](#requirements)
+[![Rust](https://img.shields.io/badge/made%20with-Rust-B7410E?logo=rust)](https://www.rust-lang.org)
+[![License](https://img.shields.io/github/license/Clemslegoat/SpotiLite)](LICENSE)
 
-![Aperçu de SpotiLite](docs/apercu.png)
+</div>
 
-SpotiLite remplace l'application Spotify de bureau quand vous voulez simplement écouter votre
-musique sans qu'elle occupe la moitié de la mémoire de votre PC : environ **250 Mo au total au lieu
-de 700 Mo** pour l'application officielle, mesuré sur le même PC.
+> [!IMPORTANT]
+> **A Spotify Premium account is required.** Playback goes through Spotify's official Web Playback
+> SDK, which only works with Premium accounts. A free account can browse its library but cannot
+> play anything.
 
-- **Léger** : un seul fichier `.exe`, rien à installer. L'interface tient en quelques mégaoctets.
-- **Toute votre bibliothèque** : titres likés, albums, artistes suivis, playlists, recherche,
-  file d'attente, aléatoire, répétition.
-- **Le vrai son de Spotify** : la musique est lue par le lecteur officiel de Spotify, en qualité
-  Premium.
-- **Sobre** : fond noir profond (idéal sur écran OLED), coins arrondis, en-têtes et barre de
-  lecture aux couleurs de la pochette, barre de titre maison avec boutons aux couleurs de macOS.
-- **Économe en données** : bibliothèque gardée en cache, petites pochettes (désactivables).
-- **Intégré à Windows** : touches multimédia du clavier, panneau média de Windows, écran de
-  verrouillage.
+![SpotiLite](docs/apercu.png)
 
-## Ce qu'il vous faut
+SpotiLite is a single, self-contained `.exe` that replaces the Spotify desktop app for everyday
+listening. The interface is drawn by the CPU into a plain window buffer: no Electron, no Chromium
+for the UI, no GPU driver loaded. Audio is played by Spotify's own player, hosted in an invisible
+WebView2 instance, so every track of a Premium subscription plays exactly as it does in the
+official apps.
 
-- Un compte **Spotify Premium**.
-- Windows 10 ou 11 (64 bits). WebView2, le moteur d'Edge, est déjà présent sur Windows 11 et
-  Windows 10 à jour (sinon : [le télécharger](https://go.microsoft.com/fwlink/p/?LinkId=2124703)).
+## Memory usage
+
+<!-- Measurements to come: replace the zeros (RAM in MB while playing, Task Manager). -->
+
+```mermaid
+---
+config:
+  look: handDrawn
+  xyChart:
+    width: 720
+    height: 360
+---
+xychart-beta
+    title "RAM while playing (MB, lower is better)"
+    x-axis ["Spotify for Windows", "SpotiLite"]
+    y-axis "MB" 0 --> 800
+    bar [0, 0]
+```
+
+## Features
+
+- **Library**: liked songs, saved albums, followed artists, playlists, search, artist pages with
+  your liked tracks and discography.
+- **Home page** with shortcuts and recently played tracks.
+- **Playback**: play/pause, seek, volume, shuffle, repeat (all / one), local play queue (add,
+  remove), add to / remove from your playlists, like / unlike.
+- **Look**: AMOLED black theme with a white accent, rounded panels, cover-colored headers and
+  player bar, hand-drawn vector icons, custom title bar.
+- **Windows integration**: media keys, headset buttons, Windows media flyout and lock screen
+  (System Media Transport Controls), Windows 11 rounded corners and snapping.
+- **Data saving**: gzip API responses, library cached on disk and only re-downloaded when it
+  changes (playlist snapshots), small covers that can be turned off.
+- **Privacy**: no account password ever goes through SpotiLite (OAuth in the browser), credentials
+  encrypted with Windows DPAPI, no telemetry.
+- **Portable mode**: create a `spotilite-data` folder next to the executable.
+
+The interface is in French.
+
+## Requirements
+
+- Spotify **Premium**.
+- Windows 10 or 11, 64-bit, with [WebView2](https://go.microsoft.com/fwlink/p/?LinkId=2124703)
+  (preinstalled on Windows 11 and up-to-date Windows 10).
+- A free Spotify developer app (created once, in two minutes, see below).
 
 ## Installation
 
-1. Allez dans les [**Releases**](https://github.com/Clemslegoat/SpotiLite/releases/latest) et
-   téléchargez **`SpotiLite.exe`**.
-2. Lancez-le. C'est tout : pas d'installation, pas de droits administrateur.
+1. Download **`SpotiLite.exe`** from the [latest release](https://github.com/Clemslegoat/SpotiLite/releases/latest).
+2. Run it. No installer, no administrator rights.
 
-Si Windows affiche « Windows a protégé votre ordinateur » : cliquez sur *Informations
-complémentaires* puis *Exécuter quand même*. Cet avertissement apparaît pour toutes les
-applications qui ne sont pas signées par un certificat payant.
+The executable is not code-signed: if SmartScreen warns, choose *More info* → *Run anyway*.
 
-## Premier lancement : 2 minutes, une seule fois
+### First launch
 
-Spotify demande que chaque application tierce passe par une « application développeur » créée
-avec votre compte. C'est gratuit et SpotiLite vous guide pas à pas :
+Spotify only lets third-party clients in through a developer app created by the user. SpotiLite
+shows a step-by-step guide:
 
-![Écran de configuration](docs/configuration.png)
+1. Open the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and click
+   **Create app**.
+2. Add the redirect URI `http://127.0.0.1:8898/login`.
+3. Tick **Web API** and **Web Playback SDK**, then save.
+4. Paste the **Client ID** and **Client Secret** into SpotiLite and accept the authorization in
+   the browser.
 
-1. Ouvrez le [tableau de bord Spotify](https://developer.spotify.com/dashboard), connectez-vous et
-   cliquez sur **Create app**.
-2. Donnez-lui un nom et une description au choix (par exemple « SpotiLite »).
-3. Dans **Redirect URIs**, collez `http://127.0.0.1:8898/login` (bouton *Copier* dans SpotiLite)
-   puis cliquez sur **Add**.
-4. Cochez **Web API** et **Web Playback SDK**, acceptez les conditions et cliquez sur **Save**.
-5. Ouvrez **Settings**, copiez le **Client ID** et le **Client Secret** (*View client secret*),
-   collez-les dans SpotiLite, cliquez sur **Connecter** et acceptez dans le navigateur.
+A development-mode app accepts up to 5 Spotify accounts, added under *User Management*. Using your
+own app also means your own API quota, shared with nobody.
 
-Votre mot de passe Spotify n'est jamais saisi dans SpotiLite : la connexion se fait sur la page
-officielle de Spotify. Le Client Secret et la connexion sont chiffrés par Windows et ne quittent
-votre PC que pour aller chez Spotify.
+## Keyboard shortcuts
 
-## Utilisation
-
-- **Accueil** : raccourcis vers votre bibliothèque et vos dernières écoutes.
-- **Menu de gauche** : recherche, accueil, titres likés, albums, artistes, file d'attente,
-  playlists et réglages.
-- **Double-clic** sur un titre pour le lire, **clic droit** pour l'ajouter à la file (ou l'en
-  retirer, dans la file d'attente) ou à une de vos playlists, aller à l'album ou à l'artiste,
-  l'aimer ou copier son lien.
-- **Barre du bas** : aléatoire, précédent, lecture/pause, suivant, répétition, position, file
-  d'attente et volume.
-- SpotiLite apparaît comme appareil « SpotiLite » dans vos autres applications Spotify (téléphone,
-  enceintes…).
-
-### Raccourcis clavier
-
-| Touche | Action |
+| Key | Action |
 |---|---|
-| `Espace` | Lecture / pause |
-| `Ctrl` + `→` / `←` | Titre suivant / précédent |
+| `Space` | Play / pause |
+| `Ctrl` + `→` / `←` | Next / previous track |
 | `Ctrl` + `↑` / `↓` | Volume |
-| `Ctrl` + `F` | Rechercher |
-| `Ctrl` + `L` | Aimer le titre en cours |
-| `Alt` + `←` ou bouton « précédent » de la souris | Retour |
-| `↑` / `↓` puis `Entrée` | Parcourir une liste et lancer un titre |
-| Touches multimédia | Lecture, pause, suivant, précédent |
+| `Ctrl` + `F` | Search |
+| `Ctrl` + `L` | Like the current track |
+| `Alt` + `←`, mouse back button | Back |
+| `↑` / `↓`, `Enter` | Move in a list, play |
+| Right click on a track | Queue, add to / remove from a playlist, album, artist, like, copy link |
 
-## Questions fréquentes
+## How it works
 
-**Est-ce gratuit ?** Oui, SpotiLite est gratuit et open source. Il faut en revanche un abonnement
-Spotify Premium.
-
-**Ça marche avec un compte gratuit ?** Non. Le lecteur officiel de Spotify qu'utilise SpotiLite
-n'est disponible que pour les comptes Premium.
-
-**Quelle est la qualité du son ?** Celle du lecteur web de Spotify en Premium : AAC à 256 kbit/s,
-choisie par Spotify. Il n'y a pas de réglage de qualité ni de son sans perte (lossless).
-
-**Pourquoi créer une « application » sur le site de Spotify ?** Spotify n'autorise les
-applications tierces qu'avec un identifiant créé par un compte. Avoir le vôtre vous évite de
-partager les limites de requêtes avec d'autres utilisateurs.
-
-**J'écoute avec un autre compte que celui qui a créé l'application.** Ajoutez ce compte dans
-**User Management** sur la page de votre application Spotify.
-
-**Certaines playlists ne montrent pas leurs titres.** Spotify ne donne pas le contenu des
-playlists des autres utilisateurs aux applications personnelles. SpotiLite les fait alors lire
-directement par Spotify : les titres s'affichent au fil de la lecture et la file d'attente montre
-les suivants.
-
-**Pourquoi la page d'un artiste n'a pas ses « titres populaires » ?** Spotify ne les donne plus
-aux applications personnelles. La page montre à la place vos titres likés de cet artiste et sa
-discographie, et le bouton ▶ fait jouer ses titres populaires par Spotify. La page *Artistes*
-montre les artistes que vous suivez et ceux qui reviennent le plus dans vos titres likés.
-
-**Spotify me redemande une autorisation.** Une nouvelle version peut avoir besoin d'une
-permission en plus (par exemple pour les artistes suivis) : cliquez sur *Réglages → Compte →
-Autoriser* et acceptez dans le navigateur.
-
-**Comment réduire encore la mémoire ?** Le lecteur se met en veille après 5 minutes de pause
-(*Réglages → Lecture → Mettre en veille le lecteur*) et SpotiLite rend sa mémoire à Windows quand la
-fenêtre est réduite. La mémoire totale utilisée, lecteur compris, est affichée en bas du menu.
-
-**Où sont mes données ? Comment tout effacer ?** Les réglages sont dans `%APPDATA%\SpotiLite`, le
-cache et le journal dans `%LOCALAPPDATA%\SpotiLite`. *Réglages → Se déconnecter* efface la
-connexion et la bibliothèque en cache ; supprimer ces deux dossiers efface tout.
-
-**Peut-on l'utiliser depuis une clé USB ?** Oui : créez un dossier `spotilite-data` à côté de
-`SpotiLite.exe`, tout y sera enregistré.
-
-**Un problème ?** Ouvrez une [issue](https://github.com/Clemslegoat/SpotiLite/issues) en joignant
-si possible le journal `%LOCALAPPDATA%\SpotiLite\spotilite.log`.
-
-## Limites
-
-- Pas de podcasts ni de paroles.
-- Un très court blanc peut s'entendre entre deux titres de la file de SpotiLite.
-- Windows uniquement.
-- SpotiLite est un client **non officiel**, sans lien avec Spotify. Il repose sur le lecteur web
-  et l'API publique de Spotify, que Spotify peut modifier à tout moment.
-
----
-
-## Pour les développeurs
-
-### Comment ça marche
-
-L'interface est dessinée par l'application elle-même (Rust + [egui](https://github.com/emilk/egui)),
-**par le processeur**, dans une simple fenêtre Windows : aucun moteur web pour l'interface, aucun
-pilote graphique chargé. Le son vient du lecteur officiel de Spotify
-([Web Playback SDK](https://developer.spotify.com/documentation/web-playback-sdk)), exécuté de façon
-invisible dans WebView2 et déchiffré par le DRM d'Edge comme dans un navigateur. SpotiLite garde sa
-propre file d'attente et demande à Spotify de jouer chaque titre sur ce lecteur
-(`PUT /me/player/play`).
-
-Mesures sous Windows (intégration continue) : **interface 6,7 Mo** à l'ouverture (ensemble de
-travail privé), **lecteur 121 Mo** en profil allégé pendant la lecture, **0 Mo** en veille.
-
-| Partie | Ce qui réduit la mémoire |
-|---|---|
-| Interface | Rendu par le processeur (pas de pilote OpenGL/Direct3D), polices du système projetées en mémoire, un seul fil réseau, au plus 48 vignettes de 128 px et 12 pages en mémoire, mémoire rendue quand la fenêtre est réduite. |
-| Lecteur (WebView2) | Démarre à la première lecture ; profil allégé (pas de processus GPU, un seul processus de rendu, objectif mémoire « bas ») avec repli automatique en mode compatible ; mis en veille après 5 minutes de pause (désactivable). |
-
-### Compiler
-
-Prérequis : [Rust](https://rustup.rs) stable ≥ 1.95 et, sous Windows, les *Build Tools* de
-Visual Studio.
-
-```powershell
-cargo build --release
-# => target\release\spotilite.exe
+```mermaid
+flowchart LR
+    subgraph exe["SpotiLite.exe"]
+        UI["UI thread<br/>egui + CPU rasterizer"]
+        BE["Backend thread<br/>single-threaded Tokio"]
+    end
+    ENG["Player<br/>hidden WebView2 + Web Playback SDK"]
+    API[("Spotify Web API")]
+    SP[("Spotify servers")]
+    UI -->|commands| BE
+    BE -->|events| UI
+    BE -->|HTTPS, gzip| API
+    BE -->|JSON messages| ENG
+    ENG -->|state, errors| BE
+    ENG -->|DRM-protected audio| SP
 ```
 
-Tests : `cargo test`. Sous Windows, `cargo test -- --ignored --nocapture` lance aussi un test réel
-du lecteur (réseau nécessaire). En build de debug, `SPOTILITE_DEMO=1` affiche l'interface avec des
-données fictives (`SPOTILITE_DEMO_SETUP=1` pour l'écran de configuration,
-`SPOTILITE_DEMO_VIEW=settings` / `queue` / `artists` pour une page). L'interface tourne aussi sous
-Linux (X11) pour le développement ; la lecture n'existe que sous Windows.
-`SPOTILITE_WEBVIEW_DEBUG=1` affiche la fenêtre du lecteur et ses outils de développement.
+- **UI**: [egui](https://github.com/emilk/egui) on [winit](https://github.com/rust-windowing/winit),
+  rasterized on the CPU ([egui_software_backend](vendor/egui_software_backend), vendored and ported
+  to egui 0.36) into a [softbuffer](https://github.com/rust-windowing/softbuffer) surface. Frames
+  are only drawn on input, backend events, or once per second while music plays.
+- **Backend**: one Tokio thread owns the Web API client, the disk cache and the play queue. It
+  talks to the UI through channels and wakes it only when something changes.
+- **Playback**: the [Web Playback SDK](https://developer.spotify.com/documentation/web-playback-sdk)
+  runs in a hidden WebView2 window and registers a Spotify Connect device. SpotiLite keeps its own
+  queue and starts each track with `PUT /me/player/play`; playlists Spotify does not expose to
+  development-mode apps are played as a whole context. Decryption uses Edge's DRM (Widevine or
+  PlayReady), like a browser.
+- **Auth**: OAuth 2.0 authorization code flow (client secret or PKCE) through a one-shot local
+  redirect server; tokens and secret are stored with DPAPI.
 
-### Architecture
+### Keeping memory low
+
+| Part | What keeps it small |
+|---|---|
+| Interface | No GPU driver or WebView for the UI; system fonts memory-mapped instead of copied; a single network thread; at most 48 covers (128 px) and 12 pages kept in memory; working set trimmed when the window is minimized. |
+| Player | Started on first playback. Lean WebView2 profile (no GPU process, one renderer process, in-process audio, low memory target) with automatic fallback to defaults. Put to sleep after 5 minutes of pause (optional), giving all its memory back. |
+
+## Building from source
+
+Requires [Rust](https://rustup.rs) 1.95+ and, on Windows, the Visual Studio Build Tools.
+
+```powershell
+git clone https://github.com/Clemslegoat/SpotiLite
+cd SpotiLite
+cargo build --release   # target\release\spotilite.exe
+```
+
+```powershell
+cargo test                             # unit tests
+cargo test -- --ignored --nocapture    # Windows: real WebView2 + SDK start-up, memory of both profiles
+```
+
+Debug builds have a demo mode with fake data: `SPOTILITE_DEMO=1`, plus `SPOTILITE_DEMO_VIEW=home`,
+`settings`, `queue`, `artists`, `artist` or `playlist`, `SPOTILITE_DEMO_SETUP=1` for the setup
+screen, `SPOTILITE_DEMO_ICONS=1` for the icon sheet. The interface also runs on Linux (X11) for
+development; playback is Windows-only. `SPOTILITE_WEBVIEW_DEBUG=1` shows the player window and its
+developer tools.
+
+<details>
+<summary>Project layout</summary>
 
 ```
 src/
-├── main.rs          démarrage, icône dessinée par le code
-├── window.rs        fenêtre winit + egui, rendu par le processeur (softbuffer)
-├── ui/              interface egui (thème, écrans, barre de titre, widgets, icônes, dégradés)
-├── backend/         fil réseau (Tokio, un seul fil)
-│   ├── mod.rs       commandes, file de lecture, cache de bibliothèque
-│   ├── engine/      lecteur : WebView2 invisible + Web Playback SDK de Spotify
-│   ├── auth.rs      OAuth 2.0 dans le navigateur (Client Secret ou PKCE)
-│   ├── webapi.rs    client minimal de l'API Web (gzip, pagination, reprise sur 429)
-│   ├── vault.rs     secrets chiffrés avec DPAPI sous Windows
-│   └── store.rs     cache disque (JSON et vignettes)
-├── queue.rs         file de lecture locale (aléatoire, répétition, ajouts)
-├── media.rs         touches multimédia et panneau média de Windows
-└── sys.rs           mesure et libération de la mémoire
-vendor/egui_software_backend/   rastériseur egui sur processeur (MIT/Apache-2.0), porté à egui 0.36
+├── main.rs          entry point
+├── window.rs        borderless winit window, egui frame loop, CPU rendering (softbuffer)
+├── logo.rs          embedded logo mask, window icon
+├── ui/              interface: theme, pages, title bar, widgets, vector icons, cover gradients
+├── backend/
+│   ├── mod.rs       commands and events, play queue, library cache, player lifecycle
+│   ├── engine/      WebView2 host and the page running the Web Playback SDK
+│   ├── auth.rs      OAuth 2.0 (client secret or PKCE)
+│   ├── webapi.rs    minimal Web API client (gzip, pagination, 429 retry)
+│   ├── vault.rs     DPAPI-encrypted secrets
+│   └── store.rs     disk cache (JSON, covers)
+├── queue.rs         local queue: order, shuffle, repeat, additions
+├── media.rs         System Media Transport Controls (media keys, Windows flyout)
+└── sys.rs           memory measurement and trimming
+vendor/egui_software_backend/   CPU rasterizer for egui (MIT/Apache-2.0)
 ```
 
-## Licence
+</details>
 
-MIT. Le rastériseur `vendor/egui_software_backend` est sous licence MIT ou Apache-2.0 (voir ses
-fichiers de licence). SpotiLite n'est ni affilié à Spotify ni approuvé par Spotify. « Spotify » est
-une marque de Spotify AB.
+## Files
+
+| What | Where |
+|---|---|
+| Settings, encrypted credentials, recently played | `%APPDATA%\SpotiLite` |
+| Cache (library, covers, player profile) and log | `%LOCALAPPDATA%\SpotiLite` |
+| Portable mode | `spotilite-data\` next to `SpotiLite.exe` |
+
+## Limitations
+
+- Windows only; no podcasts or lyrics.
+- Since February 2026, Spotify gives development-mode apps neither the content of other users'
+  playlists nor artists' top tracks: such playlists are played as a whole by Spotify, and artist
+  pages show your liked tracks and the discography instead.
+- A short gap can be heard between two tracks of SpotiLite's own queue.
+- Audio quality is the web player's: AAC 256 kbit/s for Premium, chosen by Spotify.
+
+## License
+
+[MIT](LICENSE). The vendored rasterizer in `vendor/egui_software_backend` is MIT or Apache-2.0.
+
+SpotiLite is an unofficial client, not affiliated with or endorsed by Spotify AB. "Spotify" is a
+trademark of Spotify AB.

@@ -1106,6 +1106,18 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
             ui.close();
         }
         add_to_playlist_menu(app, ui, &track);
+        // On one of the user's playlists: remove the track from it.
+        if let ViewKey::Playlist(id) = &app.view
+            && let Some(playlist) = app.playlists.iter().find(|pl| &pl.id == id && app.can_edit(pl))
+            && ui.button("Retirer de cette playlist").clicked()
+        {
+            app.send(Command::RemoveFromPlaylist {
+                playlist_id: playlist.id.clone(),
+                playlist_name: playlist.name.clone(),
+                track: track.clone(),
+            });
+            ui.close();
+        }
         ui.separator();
         let liked = app.player.liked.get(&track.id).copied();
         let like_label =
@@ -1137,7 +1149,7 @@ fn add_to_playlist_menu(app: &mut App, ui: &mut Ui, track: &Track) {
     let editable: Vec<(String, String)> = app
         .playlists
         .iter()
-        .filter(|pl| pl.collaborative || (!app.user_id.is_empty() && pl.owner_id == app.user_id))
+        .filter(|pl| app.can_edit(pl))
         .map(|pl| (pl.id.clone(), pl.name.clone()))
         .collect();
     ui.add_enabled_ui(!editable.is_empty(), |ui| {

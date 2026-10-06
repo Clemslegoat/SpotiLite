@@ -668,6 +668,11 @@ impl App {
         let _ = std::fs::remove_file(self.paths.recent_file());
     }
 
+    /// Tracks can be added to and removed from the user's own and collaborative playlists.
+    fn can_edit(&self, playlist: &PlaylistSummary) -> bool {
+        playlist.collaborative || (!self.user_id.is_empty() && playlist.owner_id == self.user_id)
+    }
+
     /// Memory of SpotiLite and of its player, together.
     fn total_memory(&self) -> u64 {
         self.memory.private_working_set + self.engine_memory
