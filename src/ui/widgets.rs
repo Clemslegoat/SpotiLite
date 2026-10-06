@@ -11,6 +11,7 @@ use super::theme::{self, Palette};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {
+    Home,
     Play,
     Pause,
     Next,
@@ -33,9 +34,20 @@ pub enum Icon {
 /// fonts: round caps and joins, finely sampled curves, filled shapes with
 /// rounded corners. Large icons (30 px and more) get extra details.
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
-    let pen = Pen::new(painter, rect, color);
+    paint_icon_turned(painter, rect, icon, color, 0.0);
+}
+
+/// Same, turned by `angle` radians around its center.
+pub fn paint_icon_turned(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, angle: f32) {
+    let pen = Pen::new(painter, rect, color, angle);
     let detailed = pen.unit >= 1.25;
     match icon {
+        Icon::Home => {
+            // Roof, walls and door.
+            pen.path(&[(3.6, 11.2), (12.0, 4.0), (20.4, 11.2)]);
+            pen.path(&[(6.2, 9.4), (6.2, 19.6), (17.8, 19.6), (17.8, 9.4)]);
+            pen.path(&[(10.0, 19.6), (10.0, 14.6), (14.0, 14.6), (14.0, 19.6)]);
+        }
         Icon::Play => pen.fill_rounded(&[(8.0, 5.0), (19.4, 12.0), (8.0, 19.0)], 1.9),
         Icon::Pause => {
             pen.fill_rect((6.6, 5.0), (10.4, 19.0), 1.4);
@@ -182,13 +194,16 @@ struct Pen<'a> {
     unit: f32,
     color: Color32,
     width: f32,
+    /// Rotation around the center (cosine, sine).
+    turn: (f32, f32),
 }
 
 impl<'a> Pen<'a> {
-    fn new(painter: &'a egui::Painter, rect: Rect, color: Color32) -> Self {
+    fn new(painter: &'a egui::Painter, rect: Rect, color: Color32, angle: f32) -> Self {
         let unit = rect.width().min(rect.height()) / 24.0;
         let origin = rect.center() - vec2(12.0, 12.0) * unit;
-        Pen { painter, origin, unit, color, width: (1.9 * unit).clamp(1.3, 3.2) }
+        let turn = (angle.cos(), angle.sin());
+        Pen { painter, origin, unit, color, width: (1.9 * unit).clamp(1.3, 3.2), turn }
     }
 
     fn with_width(self, width: f32) -> Self {
@@ -196,7 +211,10 @@ impl<'a> Pen<'a> {
     }
 
     fn at(&self, x: f32, y: f32) -> Pos2 {
-        self.origin + vec2(x, y) * self.unit
+        let (dx, dy) = (x - 12.0, y - 12.0);
+        let (cos, sin) = self.turn;
+        let turned = vec2(12.0 + dx * cos - dy * sin, 12.0 + dx * sin + dy * cos);
+        self.origin + turned * self.unit
     }
 
     /// Points of a circular arc (degrees, clockwise on screen).
@@ -390,6 +408,52 @@ pub fn icon_button(
         }
     }
     response
+}
+
+/// Refresh button whose arrow turns while `busy`, and for at least a moment after
+/// a click; it stops at the end of a turn. True when clicked (ignored while busy).
+pub fn refresh_button(ui: &mut Ui, p: &Palette, size: f32, busy: bool, hint: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(hint);
+    let ctx = ui.ctx().clone();
+    let now = ctx.input(|i| i.time);
+    let key = response.id.with("turning-since");
+    let since: Option<f64> = ctx.data(|d| d.get_temp(key));
+    const TURNS_PER_SECOND: f64 = 1.25;
+    let clicked = response.clicked() && !busy;
+    let since = match since {
+        _ if clicked => Some(since.unwrap_or(now)),
+        Some(start) => {
+            let elapsed = now - start;
+            let turn = (elapsed * TURNS_PER_SECOND).fract();
+            // Keeps turning while busy (20 s at most), for 0.8 s at least, then
+            // up to the end of the turn.
+            let finishing = turn > 0.05 && turn < 0.95;
+            ((busy && elapsed < 20.0) || elapsed < 0.8 || finishing).then_some(start)
+        }
+        None if busy => Some(now),
+        None => None,
+    };
+    ctx.data_mut(|d| match since {
+        Some(start) => {
+            d.insert_temp(key, start);
+        }
+        None => d.remove::<f64>(key),
+    });
+    let angle = since.map_or(0.0, |start| ((now - start) * TURNS_PER_SECOND * std::f64::consts::TAU) as f32);
+    if since.is_some() {
+        ctx.request_repaint();
+    }
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        if hovered {
+            ui.painter().circle_filled(rect.center(), size * 0.5, Color32::from_white_alpha(26));
+        }
+        let color = if hovered || since.is_some() { p.text } else { p.dim };
+        let inner = rect.shrink(size * 0.22);
+        paint_icon_turned(ui.painter(), inner, Icon::Refresh, color, angle);
+    }
+    clicked
 }
 
 /// Pill button: accent filled (`primary`) or subtle.

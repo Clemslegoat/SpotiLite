@@ -1,6 +1,7 @@
 //! Screens and panels: rounded surfaces on a black window.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Layout, Margin, Rect, RichText, ScrollArea,
@@ -105,6 +106,7 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
     }
     ui.add_space(12.0);
 
+    nav_item(app, ui, Icon::Home, "Accueil", ViewKey::Home, None);
     nav_item(app, ui, Icon::Heart { filled: true }, "Titres likés", ViewKey::Liked, None);
     nav_item(app, ui, Icon::Disc, "Albums", ViewKey::SavedAlbums, None);
     nav_item(app, ui, Icon::Artist, "Artistes", ViewKey::Artists, None);
@@ -117,10 +119,9 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
         ui.add_space(4.0);
         ui.label(RichText::new("PLAYLISTS").font(theme::strong_font(11.0)).color(p.faint));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::round_button(ui, &p, Icon::Refresh, 24.0, ButtonStyle::Plain, false)
-                .on_hover_text("Actualiser les playlists")
-                .clicked()
-            {
+            let busy = app.playlists_loading.is_some_and(|t| t.elapsed() < Duration::from_secs(15));
+            if widgets::refresh_button(ui, &p, 24.0, busy, "Actualiser les playlists") {
+                app.playlists_loading = Some(Instant::now());
                 app.send(Command::LoadPlaylists);
             }
         });
@@ -148,18 +149,9 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
         ui.label(RichText::new(data).font(small.clone()).color(p.faint)).on_hover_text(
             "Cette session : interface et pochettes (mesuré) + audio (mesuré par le lecteur).",
         );
-        let ram = if app.engine_memory > 0 {
-            format!(
-                "RAM {} + lecteur {}",
-                human_bytes(app.memory.private_working_set),
-                human_bytes(app.engine_memory)
-            )
-        } else {
-            format!("RAM {}", human_bytes(app.memory.private_working_set))
-        };
+        let ram = format!("RAM : {}", human_bytes(app.total_memory()));
         ui.label(RichText::new(ram).font(small).color(p.faint)).on_hover_text(
-            "Mémoire de SpotiLite, telle qu'affichée par le Gestionnaire des tâches, et celle du lecteur \
-             (processus Microsoft Edge WebView2) quand il tourne.",
+            "Mémoire utilisée par SpotiLite, lecteur compris (valeurs du Gestionnaire des tâches).",
         );
         ui.add_space(4.0);
         nav_item(app, ui, Icon::Settings, "Réglages", ViewKey::Settings, None);
@@ -220,7 +212,7 @@ fn content(app: &mut App, ui: &mut Ui) {
     match &view {
         ViewKey::Settings => return settings_page(app, ui),
         ViewKey::Queue => return queue_page(app, ui),
-        ViewKey::Welcome => return welcome_page(app, ui),
+        ViewKey::Home => return home_page(app, ui),
         _ => {}
     }
     let p = app.palette;
@@ -275,11 +267,26 @@ fn content(app: &mut App, ui: &mut Ui) {
     }
 }
 
-fn welcome_page(app: &mut App, ui: &mut Ui) {
+fn home_page(app: &mut App, ui: &mut Ui) {
     let p = app.palette;
     let hello = if app.user.is_empty() { "Bonjour".to_string() } else { format!("Bonjour {}", app.user) };
-    header(app, ui, &hello, "Que voulez-vous écouter ?", None);
+    header(app, ui, &hello, "", None);
     ui.add_space(18.0);
+    ScrollArea::vertical().id_salt("home").auto_shrink([false, false]).show(ui, |ui| {
+        shortcuts(app, ui);
+        if !app.recent.is_empty() {
+            ui.add_space(18.0);
+            section_title(ui, &p, "Écoutés récemment");
+            ui.add_space(4.0);
+            recent_grid(app, ui);
+        }
+        ui.add_space(12.0);
+    });
+}
+
+/// Tiles to the library and the first playlists.
+fn shortcuts(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
     let mut shortcuts: Vec<(Icon, String, ViewKey)> = vec![
         (Icon::Heart { filled: true }, "Titres likés".into(), ViewKey::Liked),
         (Icon::Disc, "Albums".into(), ViewKey::SavedAlbums),
@@ -288,14 +295,15 @@ fn welcome_page(app: &mut App, ui: &mut Ui) {
     shortcuts.extend(
         app.playlists
             .iter()
-            .take(6)
+            .take(5)
             .map(|pl| (Icon::Library, pl.name.clone(), ViewKey::Playlist(pl.id.clone()))),
     );
-    let columns = ((ui.available_width() + 10.0) / 250.0).floor().max(1.0) as usize;
-    let width = (ui.available_width() - 10.0 * (columns as f32 - 1.0)) / columns as f32;
+    let gap = 10.0;
+    let columns = ((ui.available_width() + gap) / 240.0).floor().clamp(1.0, 4.0) as usize;
+    let width = (ui.available_width() - gap * (columns as f32 - 1.0)) / columns as f32;
     for row in shortcuts.chunks(columns) {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().item_spacing.x = gap;
             for (icon, label, view) in row {
                 let (rect, response) = ui.allocate_exact_size(vec2(width, 58.0), Sense::click());
                 let fill = if response.hovered() { p.line } else { p.raised };
@@ -321,8 +329,84 @@ fn welcome_page(app: &mut App, ui: &mut Ui) {
                 }
             }
         });
-        ui.add_space(10.0);
+        ui.add_space(gap);
     }
+}
+
+/// Recently played tracks as cards: cover, title and artists; a click plays
+/// from there.
+fn recent_grid(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    let tracks = app.recent.clone();
+    let gap = 12.0;
+    let width = ui.available_width();
+    let columns = ((width + gap) / (170.0 + gap)).floor().max(2.0) as usize;
+    let card_w = (width - gap * (columns as f32 - 1.0)) / columns as f32;
+    let art = (card_w - 20.0).min(160.0);
+    let card_h = art + 64.0;
+    for (row_index, row) in tracks.chunks(columns).take(3).enumerate() {
+        let (row_rect, _) = ui.allocate_exact_size(vec2(width, card_h), Sense::hover());
+        if !ui.is_rect_visible(row_rect) {
+            ui.add_space(gap);
+            continue;
+        }
+        for (i, track) in row.iter().enumerate() {
+            let index = row_index * columns + i;
+            let rect = Rect::from_min_size(
+                row_rect.min + vec2(i as f32 * (card_w + gap), 0.0),
+                vec2(card_w, card_h),
+            );
+            let response = ui.interact(rect, Id::new(("recent", index)), Sense::click());
+            let hovered = response.hovered();
+            if hovered {
+                ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_CARD), p.hover);
+            }
+            let cover = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(art, art));
+            let url = track.image.as_deref().map(larger_cover);
+            let texture = if app.settings.show_covers { app.cover(url.as_ref()) } else { None };
+            widgets::cover(ui, &p, cover, texture, 8);
+            let playing = app.player.now.as_ref().is_some_and(|t| t.id == track.id) && app.player.playing;
+            if hovered || playing {
+                // Round play button over the cover, like the banners'.
+                let center = cover.right_bottom() - vec2(26.0, 26.0);
+                ui.painter().circle_filled(center, 20.0, p.accent);
+                let icon = if playing { Icon::Pause } else { Icon::Play };
+                let glyph = Rect::from_center_size(center, vec2(22.0, 22.0));
+                widgets::paint_icon(ui.painter(), glyph, icon, p.on_accent);
+            }
+            paint_text(
+                ui,
+                pos2(cover.left(), cover.bottom() + 16.0),
+                &track.name,
+                theme::strong_font(14.0),
+                p.text,
+                art,
+            );
+            let artists = track.artists_joined();
+            paint_text(
+                ui,
+                pos2(cover.left(), cover.bottom() + 36.0),
+                &artists,
+                theme::small_font(),
+                p.dim,
+                art,
+            );
+            if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                if playing {
+                    app.send(Command::PlayPause);
+                } else if track.playable {
+                    app.play(tracks.clone(), index);
+                }
+            }
+        }
+        ui.add_space(gap);
+    }
+}
+
+/// Spotify serves each cover in 64, 300 and 640 px under the same name with a
+/// size prefix: the cards use the 300 px one (other links are kept as they are).
+fn larger_cover(url: &str) -> String {
+    url.replacen("ab67616d00004851", "ab67616d00001e02", 1)
 }
 
 /// Title block with a back button and optional refresh action.
@@ -341,12 +425,8 @@ fn header(app: &mut App, ui: &mut Ui, title: &str, subtitle: &str, refresh: Opti
         ui.label(galley);
         if let Some(view) = refresh {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if app.loading.contains(view) {
-                    ui.add(egui::Spinner::new().color(p.accent).size(16.0));
-                } else if widgets::round_button(ui, &p, Icon::Refresh, 30.0, ButtonStyle::Plain, false)
-                    .on_hover_text("Actualiser depuis Spotify")
-                    .clicked()
-                {
+                let busy = app.loading.contains(view);
+                if widgets::refresh_button(ui, &p, 30.0, busy, "Actualiser depuis Spotify") {
                     let view = view.clone();
                     app.navigate_with(view, true);
                 }
@@ -740,12 +820,8 @@ fn back_row(app: &mut App, ui: &mut Ui, refresh: Option<&ViewKey>, filter: bool)
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some(view) = refresh {
-                if app.loading.contains(view) {
-                    ui.add(egui::Spinner::new().color(p.accent).size(16.0));
-                } else if widgets::round_button(ui, &p, Icon::Refresh, 30.0, ButtonStyle::Plain, false)
-                    .on_hover_text("Actualiser depuis Spotify")
-                    .clicked()
-                {
+                let busy = app.loading.contains(view);
+                if widgets::refresh_button(ui, &p, 30.0, busy, "Actualiser depuis Spotify") {
                     let view = view.clone();
                     app.navigate_with(view, true);
                 }
@@ -1424,6 +1500,7 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
                     app.setup_secret.clear();
                 }
                 if widgets::pill(ui, &p, "Se déconnecter", false).clicked() {
+                    app.forget_played();
                     app.send(Command::Logout);
                 }
             });
@@ -1431,20 +1508,10 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
 
         card(ui, &p, "Lecture", |ui| {
             option_row(ui, &p, "Lecteur", |ui| {
-                let mut state = app.engine_status.clone();
-                if app.engine_memory > 0 {
-                    state.push_str(&format!(" · {}", human_bytes(app.engine_memory)));
-                }
-                ui.label(RichText::new(state).color(p.text));
+                ui.label(RichText::new(&app.engine_status).color(p.text));
             });
-            option_row(ui, &p, "Veille après une pause", |ui| {
-                let choices = [5, 10, 30, 0];
-                let current = choices.iter().position(|m| *m == app.settings.engine_idle_minutes);
-                if let Some(i) = widgets::segmented(ui, &p, &["5 min", "10 min", "30 min", "Jamais"], current)
-                {
-                    app.settings.engine_idle_minutes = choices[i];
-                    changed = true;
-                }
+            option_row(ui, &p, "Mettre en veille le lecteur", |ui| {
+                changed |= widgets::toggle(ui, &p, &mut app.settings.engine_sleep);
             });
         });
 
@@ -1464,11 +1531,7 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
 
         card(ui, &p, "Mémoire et données", |ui| {
             option_row(ui, &p, "Utilisée", |ui| {
-                let mut text = human_bytes(app.memory.private_working_set);
-                if app.engine_memory > 0 {
-                    text.push_str(&format!(" + lecteur {}", human_bytes(app.engine_memory)));
-                }
-                ui.label(RichText::new(text).color(p.text));
+                ui.label(RichText::new(human_bytes(app.total_memory())).color(p.text));
             });
             option_row(ui, &p, "Libérer quand réduite", |ui| {
                 changed |= widgets::toggle(ui, &p, &mut app.settings.trim_when_minimized);
@@ -1553,12 +1616,11 @@ pub fn setup_screen(app: &mut App, ui: &mut Ui) {
                                 ui.columns(2, |columns| {
                                     setup_guide(app, &mut columns[0]);
                                     setup_form(app, &mut columns[1]);
-                                    setup_footer(app, &mut columns[1]);
                                 });
                             } else {
                                 setup_guide(app, ui);
                                 setup_form(app, ui);
-                                setup_footer(app, ui);
+                                ui.add_space(24.0);
                             }
                         });
                     });
@@ -1650,13 +1712,6 @@ fn setup_guide(app: &mut App, ui: &mut Ui) {
                 .color(p.text),
             );
         });
-        ui.label(
-            RichText::new(
-                "Vous écoutez avec un autre compte que celui du tableau de bord ? Ajoutez-le dans « User Management ».",
-            )
-            .small()
-            .color(p.faint),
-        );
     });
 }
 
@@ -1745,18 +1800,6 @@ fn setup_form(app: &mut App, ui: &mut Ui) {
     });
 }
 
-fn setup_footer(app: &mut App, ui: &mut Ui) {
-    let p = app.palette;
-    ui.label(
-        RichText::new(
-            "Le Client Secret reste sur cet ordinateur, chiffré par Windows pour votre session, et n'est envoyé qu'à Spotify.",
-        )
-        .small()
-        .color(p.faint),
-    );
-    ui.add_space(24.0);
-}
-
 /// One numbered step of the guide.
 fn step(ui: &mut Ui, p: &theme::Palette, number: u32, add: impl FnOnce(&mut Ui)) {
     ui.horizontal_top(|ui| {
@@ -1817,6 +1860,7 @@ pub fn toasts(app: &App, ctx: &egui::Context) {
 pub fn icon_sheet(app: &mut App, ui: &mut Ui) {
     let p = app.palette;
     let icons = [
+        Icon::Home,
         Icon::Play,
         Icon::Pause,
         Icon::Prev,

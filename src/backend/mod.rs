@@ -310,6 +310,9 @@ fn liked_by(store: &Store, artist: &str) -> Arc<Vec<Track>> {
     Arc::new(tracks)
 }
 
+/// Pause after which the engine is put to sleep (when enabled).
+const ENGINE_SLEEP: Duration = Duration::from_secs(5 * 60);
+
 /// Bitrate assumed when the engine's traffic cannot be measured.
 const ESTIMATED_KBPS: u64 = 128;
 /// Present when the lean engine profile could not play on this PC.
@@ -854,9 +857,8 @@ impl Core {
                 self.ui.error("Spotify ne démarre pas la lecture. Réessayez dans un instant.");
                 self.send_playback(false);
             }
-            // Asleep after a long pause: its WebView2 processes give their memory back.
-            let idle = u64::from(self.settings.engine_idle_minutes) * 60;
-            if idle > 0 && !self.playing && self.last_active.elapsed() >= Duration::from_secs(idle) {
+            // Asleep after a pause: its WebView2 processes give their memory back.
+            if self.settings.engine_sleep && !self.playing && self.last_active.elapsed() >= ENGINE_SLEEP {
                 log::info!("engine idle: stopped");
                 self.loaded = false;
                 self.stop_engine();
@@ -1721,7 +1723,7 @@ impl Core {
                     }
                 });
             }
-            ViewKey::Queue | ViewKey::Settings | ViewKey::Welcome => {}
+            ViewKey::Queue | ViewKey::Settings | ViewKey::Home => {}
         }
     }
 

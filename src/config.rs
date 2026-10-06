@@ -23,9 +23,9 @@ pub struct Settings {
     pub redirect_port: u16,
     /// Release unused memory pages when the window is minimized (Windows only).
     pub trim_when_minimized: bool,
-    /// Stop the playback engine (its WebView2 processes) after this many minutes
-    /// without playing; 0 keeps it running.
-    pub engine_idle_minutes: u32,
+    /// Stop the playback engine (its WebView2 processes) after 5 minutes without
+    /// playing; it starts again at the next playback.
+    pub engine_sleep: bool,
     pub window_size: [f32; 2],
 }
 
@@ -40,7 +40,7 @@ impl Default for Settings {
             legacy_client_id: String::new(),
             redirect_port: 8898,
             trim_when_minimized: true,
-            engine_idle_minutes: 10,
+            engine_sleep: true,
             window_size: [1040.0, 680.0],
         }
     }
@@ -68,7 +68,6 @@ impl Settings {
 
     fn sanitized(mut self) -> Self {
         self.volume = self.volume.clamp(0.0, 1.0);
-        self.engine_idle_minutes = self.engine_idle_minutes.min(240);
         self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
         self.legacy_client_id = self.legacy_client_id.trim().to_string();
         if self.redirect_port == 0 {
@@ -141,6 +140,11 @@ impl Paths {
         self.config.join("webapi-token.json")
     }
 
+    /// Tracks recently played in SpotiLite (home page).
+    pub fn recent_file(&self) -> PathBuf {
+        self.config.join("recent.json")
+    }
+
     pub fn log_file(&self) -> PathBuf {
         self.cache.join("spotilite.log")
     }
@@ -185,13 +189,13 @@ mod tests {
 
     #[test]
     fn partial_settings_file_keeps_defaults() {
-        // Fields of version 0.1 (quality, engine…) are ignored.
+        // Fields of older versions (quality, engine, engine_idle_minutes…) are ignored.
         let s: Settings =
-            serde_json::from_str(r#"{"quality":"High","engine":"Official","volume":3.0}"#).unwrap();
+            serde_json::from_str(r#"{"quality":"High","engine_idle_minutes":5,"volume":3.0}"#).unwrap();
         let s = s.sanitized();
         assert_eq!(s.volume, 1.0);
-        assert_eq!(s.engine_idle_minutes, 10);
         assert!(s.show_covers);
+        assert!(s.engine_sleep);
         assert_eq!(s.redirect_port, 8898);
     }
 

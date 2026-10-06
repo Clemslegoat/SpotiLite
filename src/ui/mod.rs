@@ -25,6 +25,20 @@ use crate::model::{
 use crate::sys;
 use theme::Palette;
 
+/// Recently played tracks kept for the home page.
+const MAX_RECENT: usize = 30;
+
+fn load_recent(paths: &Paths) -> Vec<Track> {
+    std::fs::read(paths.recent_file())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<Track>>(&bytes).ok())
+        .map(|mut tracks| {
+            tracks.truncate(MAX_RECENT);
+            tracks
+        })
+        .unwrap_or_default()
+}
+
 /// Pages kept in memory for instant back-navigation; older ones are dropped
 /// (they come back from the disk cache without any download).
 const MAX_PAGES: usize = 12;
@@ -158,6 +172,10 @@ pub struct App {
     /// The logo in white (128 px), and the liked tracks picture (loaded when shown).
     logo: TextureHandle,
     liked_art: Option<TextureHandle>,
+    /// Tracks recently played in SpotiLite, most recent first.
+    recent: Arc<Vec<Track>>,
+    /// When the playlists were asked again (their refresh button turns meanwhile).
+    playlists_loading: Option<Instant>,
     toasts: Vec<Toast>,
     usage: (u64, u64),
     memory: sys::Memory,
@@ -188,6 +206,7 @@ impl App {
         theme::install_fonts(ctx);
         let palette = Palette::amoled();
         theme::apply(ctx, &palette);
+        let recent = load_recent(&paths);
         ctx.set_zoom_factor(settings.ui_scale);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
 
@@ -211,7 +230,7 @@ impl App {
                 needs_playback_auth: false,
             },
             playlists: Vec::new(),
-            view: ViewKey::Welcome,
+            view: ViewKey::Home,
             history: Vec::new(),
             pages: HashMap::new(),
             page_order: VecDeque::new(),
@@ -227,6 +246,8 @@ impl App {
             covers: Covers::default(),
             logo: ctx.load_texture("logo", crate::logo::image(), TextureOptions::LINEAR),
             liked_art: None,
+            playlists_loading: None,
+            recent: Arc::new(recent),
             toasts: Vec::new(),
             usage: (0, 0),
             memory: sys::memory(),
@@ -333,6 +354,7 @@ impl App {
                 tracks: Arc::new(tracks.iter().skip(3).step_by(3).take(30).cloned().collect()),
             },
         );
+        self.recent = Arc::new(tracks.iter().skip(4).step_by(5).take(12).cloned().collect());
         self.engine_status = "Prêt · DRM Widevine".into();
         self.engine_memory = 112 * 1024 * 1024;
         // Artists: three portraits (synthetic gradients), the rest with initials.
@@ -399,6 +421,7 @@ impl App {
                 "queue" => ViewKey::Queue,
                 "artists" => ViewKey::Artists,
                 "artist" => ViewKey::Artist("a2".into()),
+                "home" => ViewKey::Home,
                 "playlist" => ViewKey::Playlist("p0".into()),
                 _ => ViewKey::Liked,
             };
@@ -429,7 +452,7 @@ impl App {
         }
         self.failures.remove(&view);
         match &view {
-            ViewKey::Welcome | ViewKey::Settings | ViewKey::Queue => {}
+            ViewKey::Home | ViewKey::Settings | ViewKey::Queue => {}
             _ => self.send(Command::Open { view, force }),
         }
     }
@@ -441,7 +464,7 @@ impl App {
             self.selected = None;
             if !self.pages.contains_key(&previous) {
                 self.failures.remove(&previous);
-                if !matches!(previous, ViewKey::Welcome | ViewKey::Settings | ViewKey::Queue) {
+                if !matches!(previous, ViewKey::Home | ViewKey::Settings | ViewKey::Queue) {
                     self.send(Command::Open { view: previous, force: false });
                 }
             }
@@ -484,7 +507,10 @@ impl App {
             Event::Notice { key, text, error } => self.toast_keyed(Some(key), text, error),
             Event::LoggedIn { user } => self.user = user,
             Event::App(status) => self.on_app_status(status),
-            Event::Playlists(list) => self.playlists = list,
+            Event::Playlists(list) => {
+                self.playlists = list;
+                self.playlists_loading = None;
+            }
             Event::Loading(view) => {
                 self.failures.remove(&view);
                 self.loading.insert(view);
@@ -517,6 +543,9 @@ impl App {
                 self.failures.insert(view, message);
             }
             Event::NowPlaying(track) => {
+                if let Some(track) = &track {
+                    self.remember_played(track);
+                }
                 self.player.now = track;
                 self.media.set_metadata(self.player.now.as_ref(), self.cover_file());
             }
@@ -594,6 +623,36 @@ impl App {
             }
         }
         self.liked_art.as_ref().map(TextureHandle::id)
+    }
+
+    /// Puts a track at the top of the recently played ones (saved at once).
+    fn remember_played(&mut self, track: &Track) {
+        if self.demo || track.id.is_empty() || self.recent.first().is_some_and(|t| t.id == track.id) {
+            return;
+        }
+        let mut recent = Vec::with_capacity(MAX_RECENT);
+        recent.push(track.clone());
+        recent.extend(self.recent.iter().filter(|t| t.id != track.id).take(MAX_RECENT - 1).cloned());
+        self.recent = Arc::new(recent);
+        match serde_json::to_vec(&*self.recent) {
+            Ok(bytes) => {
+                if let Err(e) = crate::config::write_atomic(&self.paths.recent_file(), &bytes) {
+                    log::warn!("could not save recent tracks: {e}");
+                }
+            }
+            Err(e) => log::warn!("could not serialize recent tracks: {e}"),
+        }
+    }
+
+    /// Forgets the recently played tracks (logout).
+    fn forget_played(&mut self) {
+        self.recent = Arc::default();
+        let _ = std::fs::remove_file(self.paths.recent_file());
+    }
+
+    /// Memory of SpotiLite and of its player, together.
+    fn total_memory(&self) -> u64 {
+        self.memory.private_working_set + self.engine_memory
     }
 
     /// Blurred gradient of the current track's cover, for the player bar.
@@ -686,9 +745,7 @@ impl App {
             self.setup_secret.clear();
             self.failures.clear();
             self.loading.clear();
-            if self.view == ViewKey::Welcome {
-                self.navigate(ViewKey::Liked);
-            } else if !matches!(self.view, ViewKey::Settings | ViewKey::Queue) {
+            if !matches!(self.view, ViewKey::Home | ViewKey::Settings | ViewKey::Queue) {
                 self.send(Command::Open { view: self.view.clone(), force: false });
             }
         }

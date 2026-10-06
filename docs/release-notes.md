@@ -15,7 +15,7 @@ Si Windows affiche « Windows a protégé votre ordinateur » : *Informations co
 
 - Lecture par le lecteur officiel de Spotify : tous les titres de votre abonnement se lisent.
 - Interface arrondie, barre de lecture aux couleurs de la pochette, boutons plus grands.
-- Page **Artistes** (artistes suivis) dans le menu.
+- Page d'**accueil** avec vos dernières écoutes, page **Artistes** dans le menu.
 - Réglages simplifiés.
 - Beaucoup moins de mémoire : environ 6 Mo pour l'interface, et le lecteur se met en veille
-  après une pause.
+  après 5 minutes de pause.

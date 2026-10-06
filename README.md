@@ -62,8 +62,9 @@ votre PC que pour aller chez Spotify.
 
 ## Utilisation
 
-- **Menu de gauche** : recherche, titres likés, albums, artistes, file d'attente, playlists et
-  réglages.
+- **Accueil** : raccourcis vers votre bibliothèque et vos dernières écoutes.
+- **Menu de gauche** : recherche, accueil, titres likés, albums, artistes, file d'attente,
+  playlists et réglages.
 - **Double-clic** sur un titre pour le lire, **clic droit** pour l'ajouter à la file, aller à
   l'album ou à l'artiste, l'aimer ou copier son lien.
 - **Barre du bas** : aléatoire, précédent, lecture/pause, suivant, répétition, position, file
@@ -116,9 +117,9 @@ montre les artistes que vous suivez et ceux qui reviennent le plus dans vos titr
 permission en plus (par exemple pour les artistes suivis) : cliquez sur *Réglages → Compte →
 Autoriser* et acceptez dans le navigateur.
 
-**Comment réduire encore la mémoire ?** Le lecteur se met en veille après une pause (10 minutes
-par défaut, réglable dans *Réglages → Lecture*) et SpotiLite rend sa mémoire à Windows quand la
-fenêtre est réduite. La mémoire utilisée est affichée en bas du menu.
+**Comment réduire encore la mémoire ?** Le lecteur se met en veille après 5 minutes de pause
+(*Réglages → Lecture → Mettre en veille le lecteur*) et SpotiLite rend sa mémoire à Windows quand la
+fenêtre est réduite. La mémoire totale utilisée, lecteur compris, est affichée en bas du menu.
 
 **Où sont mes données ? Comment tout effacer ?** Les réglages sont dans `%APPDATA%\SpotiLite`, le
 cache et le journal dans `%LOCALAPPDATA%\SpotiLite`. *Réglages → Se déconnecter* efface la
@@ -158,7 +159,7 @@ travail privé), **lecteur 121 Mo** en profil allégé pendant la lecture, **0 M
 | Partie | Ce qui réduit la mémoire |
 |---|---|
 | Interface | Rendu par le processeur (pas de pilote OpenGL/Direct3D), polices du système projetées en mémoire, un seul fil réseau, au plus 48 vignettes de 128 px et 12 pages en mémoire, mémoire rendue quand la fenêtre est réduite. |
-| Lecteur (WebView2) | Démarre à la première lecture ; profil allégé (pas de processus GPU, un seul processus de rendu, objectif mémoire « bas ») avec repli automatique en mode compatible ; mis en veille après une pause. |
+| Lecteur (WebView2) | Démarre à la première lecture ; profil allégé (pas de processus GPU, un seul processus de rendu, objectif mémoire « bas ») avec repli automatique en mode compatible ; mis en veille après 5 minutes de pause (désactivable). |
 
 ### Compiler
 

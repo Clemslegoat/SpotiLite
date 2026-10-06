@@ -141,7 +141,8 @@ pub struct SearchResults {
 /// Identifies what the main panel shows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ViewKey {
-    Welcome,
+    /// Home page: shortcuts and recently played tracks.
+    Home,
     Liked,
     SavedAlbums,
     /// Artists the user follows.
