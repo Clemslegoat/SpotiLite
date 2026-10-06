@@ -128,7 +128,7 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
     });
     ui.add_space(2.0);
 
-    let footer_height = 84.0;
+    let footer_height = 66.0;
     let list_height = (ui.available_height() - footer_height).max(40.0);
     let playlists = app.playlists.clone();
     ScrollArea::vertical()
@@ -145,10 +145,6 @@ fn sidebar(app: &mut App, ui: &mut Ui) {
 
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         let small = egui::FontId::proportional(11.5);
-        let data = format!("Données : {}", human_bytes(app.usage.0 + app.usage.1));
-        ui.label(RichText::new(data).font(small.clone()).color(p.faint)).on_hover_text(
-            "Cette session : interface et pochettes (mesuré) + audio (mesuré par le lecteur).",
-        );
         let ram = format!("RAM : {}", human_bytes(app.total_memory()));
         ui.label(RichText::new(ram).font(small).color(p.faint)).on_hover_text(
             "Mémoire utilisée par SpotiLite, lecteur compris (valeurs du Gestionnaire des tâches).",
