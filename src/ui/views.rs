@@ -394,13 +394,15 @@ fn recent_grid(app: &mut App, ui: &mut Ui) {
                 p.dim,
                 art,
             );
-            if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+            let response = response.on_hover_cursor(CursorIcon::PointingHand);
+            if response.clicked() {
                 if playing {
                     app.send(Command::PlayPause);
                 } else if track.playable {
                     app.play(tracks.clone(), index);
                 }
             }
+            response.context_menu(|ui| track_menu(app, ui, &tracks, index, "recent"));
         }
         ui.add_space(gap);
     }
@@ -1084,59 +1086,62 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
     } else if response.clicked() {
         app.selected = Some(index);
     }
-    let track = track.clone();
-    response.context_menu(|ui| {
-        ui.set_min_width(200.0);
-        if ui.button("Play").clicked() {
-            app.play(tracks.clone(), index);
+    response.context_menu(|ui| track_menu(app, ui, tracks, index, salt));
+}
+
+/// The right-click menu of a track, the same wherever the track is shown.
+fn track_menu(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize, salt: &str) {
+    let Some(track) = tracks.get(index).cloned() else { return };
+    ui.set_min_width(200.0);
+    if ui.button("Play").clicked() {
+        app.play(tracks.clone(), index);
+        ui.close();
+    }
+    // SpotiLite's own queue only: Spotify's (whole playlists) cannot be edited.
+    if salt == "queue" && app.player.context.is_none() {
+        if ui.button("Remove from queue").clicked() {
+            app.send(Command::RemoveFromQueue { index, track_id: track.id.clone() });
             ui.close();
         }
-        // SpotiLite's own queue only: Spotify's (whole playlists) cannot be edited.
-        if salt == "queue" && app.player.context.is_none() {
-            if ui.button("Remove from queue").clicked() {
-                app.send(Command::RemoveFromQueue { index, track_id: track.id.clone() });
-                ui.close();
-            }
-        } else if ui.button("Add to queue").clicked() {
-            app.send(Command::Enqueue(track.clone()));
+    } else if ui.button("Add to queue").clicked() {
+        app.send(Command::Enqueue(track.clone()));
+        ui.close();
+    }
+    add_to_playlist_menu(app, ui, &track);
+    // On one of the user's playlists: remove the track from it.
+    if let ViewKey::Playlist(id) = &app.view
+        && let Some(playlist) = app.playlists.iter().find(|pl| &pl.id == id && app.can_edit(pl))
+        && ui.button("Remove from this playlist").clicked()
+    {
+        app.send(Command::RemoveFromPlaylist {
+            playlist_id: playlist.id.clone(),
+            playlist_name: playlist.name.clone(),
+            track: track.clone(),
+        });
+        ui.close();
+    }
+    ui.separator();
+    let liked = app.player.liked.get(&track.id).copied();
+    let like_label = if liked == Some(true) { "Remove from Liked Songs" } else { "Save to Liked Songs" };
+    if ui.button(like_label).clicked() {
+        app.send(Command::SetLiked { track: track.clone(), liked: liked != Some(true) });
+        ui.close();
+    }
+    if !track.album_id.is_empty() && ui.button("Go to album").clicked() {
+        app.navigate(ViewKey::Album(track.album_id.clone()));
+        ui.close();
+    }
+    for artist in track.artists.iter().filter(|a| !a.id.is_empty()) {
+        if ui.button(format!("Go to {}", artist.name)).clicked() {
+            app.navigate(ViewKey::Artist(artist.id.clone()));
             ui.close();
         }
-        add_to_playlist_menu(app, ui, &track);
-        // On one of the user's playlists: remove the track from it.
-        if let ViewKey::Playlist(id) = &app.view
-            && let Some(playlist) = app.playlists.iter().find(|pl| &pl.id == id && app.can_edit(pl))
-            && ui.button("Remove from this playlist").clicked()
-        {
-            app.send(Command::RemoveFromPlaylist {
-                playlist_id: playlist.id.clone(),
-                playlist_name: playlist.name.clone(),
-                track: track.clone(),
-            });
-            ui.close();
-        }
-        ui.separator();
-        let liked = app.player.liked.get(&track.id).copied();
-        let like_label = if liked == Some(true) { "Remove from Liked Songs" } else { "Save to Liked Songs" };
-        if ui.button(like_label).clicked() {
-            app.send(Command::SetLiked { track: track.clone(), liked: liked != Some(true) });
-            ui.close();
-        }
-        if !track.album_id.is_empty() && ui.button("Go to album").clicked() {
-            app.navigate(ViewKey::Album(track.album_id.clone()));
-            ui.close();
-        }
-        for artist in track.artists.iter().filter(|a| !a.id.is_empty()) {
-            if ui.button(format!("Go to {}", artist.name)).clicked() {
-                app.navigate(ViewKey::Artist(artist.id.clone()));
-                ui.close();
-            }
-        }
-        ui.separator();
-        if ui.button("Copy link").clicked() {
-            ui.ctx().copy_text(format!("https://open.spotify.com/track/{}", track.id));
-            ui.close();
-        }
-    });
+    }
+    ui.separator();
+    if ui.button("Copy link").clicked() {
+        ui.ctx().copy_text(format!("https://open.spotify.com/track/{}", track.id));
+        ui.close();
+    }
 }
 
 /// "Add to playlist" submenu: the user's own and collaborative playlists.
