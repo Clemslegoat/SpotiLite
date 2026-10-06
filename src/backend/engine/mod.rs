@@ -359,7 +359,7 @@ impl Engine {
         #[cfg(not(windows))]
         {
             let _ = (dir, volume, profile, rx, thread_id);
-            events(EngineEvent::Failed("la lecture n'existe que sous Windows (WebView2)".into()));
+            events(EngineEvent::Failed("playback is only available on Windows (WebView2)".into()));
         }
         Self { sender }
     }
@@ -532,8 +532,8 @@ mod tests {
         );
         // What the SDK does with a rejected token (seen on a real WebView2).
         assert_eq!(
-            parse_message(r#"{"type":"error","kind":"connect","message":"connexion du lecteur refusée"}"#),
-            Some(EngineEvent::Error(ErrorKind::Connect, "connexion du lecteur refusée".into()))
+            parse_message(r#"{"type":"error","kind":"connect","message":"player connection refused"}"#),
+            Some(EngineEvent::Error(ErrorKind::Connect, "player connection refused".into()))
         );
         assert_eq!(parse_message(r#"{"type":"unknown"}"#), None);
         assert_eq!(parse_message("not json"), None);

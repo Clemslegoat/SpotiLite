@@ -737,7 +737,7 @@ pub fn format_duration(ms: u32) -> String {
 pub fn format_total(ms: u64) -> String {
     let minutes = ms / 60_000;
     if minutes >= 60 {
-        format!("{} h {:02} min", minutes / 60, minutes % 60)
+        format!("{} hr {:02} min", minutes / 60, minutes % 60)
     } else {
         format!("{minutes} min")
     }
@@ -753,6 +753,6 @@ mod tests {
         assert_eq!(format_duration(61_500), "1:01");
         assert_eq!(format_duration(3_723_000), "1:02:03");
         assert_eq!(format_total(59 * 60_000), "59 min");
-        assert_eq!(format_total(133 * 60_000), "2 h 13 min");
+        assert_eq!(format_total(133 * 60_000), "2 hr 13 min");
     }
 }

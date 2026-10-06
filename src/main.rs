@@ -26,8 +26,8 @@ fn main() {
         min_size: [600.0, 420.0],
         icon: logo::window_icon(),
     };
-    let result = window::run(options, move |ctx, window| {
-        let app = ui::App::new(ctx, window, paths, settings);
+    let result = window::run(options, move |ctx, window, waker| {
+        let app = ui::App::new(ctx, window, waker, paths, settings);
         #[cfg(debug_assertions)]
         let app = app.with_demo(ctx);
         app

@@ -36,10 +36,10 @@ impl Button {
 
     fn hint(self, maximized: bool) -> &'static str {
         match self {
-            Button::Close => "Fermer",
-            Button::Minimize => "Réduire",
-            Button::Maximize if maximized => "Restaurer",
-            Button::Maximize => "Agrandir",
+            Button::Close => "Close",
+            Button::Minimize => "Minimize",
+            Button::Maximize if maximized => "Restore",
+            Button::Maximize => "Maximize",
         }
     }
 }

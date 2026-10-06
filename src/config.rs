@@ -24,7 +24,19 @@ pub struct Settings {
     /// Stop the playback engine (its WebView2 processes) after 5 minutes without
     /// playing; it starts again at the next playback.
     pub engine_sleep: bool,
+    /// How sizes are written: MB (English) or Mo (French octets).
+    pub byte_units: ByteUnits,
     pub window_size: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ByteUnits {
+    /// KB, MB, GB with a decimal point.
+    #[default]
+    Bytes,
+    /// Ko, Mo, Go with a decimal comma.
+    Octets,
 }
 
 impl Default for Settings {
@@ -38,6 +50,7 @@ impl Default for Settings {
             legacy_client_id: String::new(),
             redirect_port: 8898,
             engine_sleep: true,
+            byte_units: ByteUnits::Bytes,
             window_size: [1040.0, 680.0],
         }
     }

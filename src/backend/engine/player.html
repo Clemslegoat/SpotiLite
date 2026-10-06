@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SpotiLite · lecteur</title>
+<title>SpotiLite · player</title>
 <style>html,body{margin:0;background:#000;color:#777;font:12px system-ui,sans-serif}</style>
 </head>
 <body>
@@ -145,11 +145,11 @@ window.onSpotifyWebPlaybackSDKReady = () => {
   }
   player.addListener("autoplay_failed", () => send({ type: "error", kind: "autoplay_failed", message: "" }));
   player.connect().then((ok) => {
-    if (!ok) send({ type: "error", kind: "connect", message: "connexion du lecteur refusée" });
+    if (!ok) send({ type: "error", kind: "connect", message: "player connection refused" });
   });
 };
 </script>
 <script src="https://sdk.scdn.co/spotify-player.js"
-        onerror="send({ type: 'error', kind: 'load', message: 'sdk.scdn.co injoignable' })"></script>
+        onerror="send({ type: 'error', kind: 'load', message: 'sdk.scdn.co unreachable' })"></script>
 </body>
 </html>

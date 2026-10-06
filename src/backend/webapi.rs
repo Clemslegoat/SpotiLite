@@ -57,15 +57,15 @@ pub enum ApiError {
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApiError::NotConnected => write!(f, "application Spotify non connectée"),
-            ApiError::Network(e) => write!(f, "réseau indisponible ({e})"),
+            ApiError::NotConnected => write!(f, "Spotify app not connected"),
+            ApiError::Network(e) => write!(f, "network unavailable ({e})"),
             ApiError::RateLimited(s) => {
-                write!(f, "Spotify limite les requêtes, réessayez dans {s} s")
+                write!(f, "Spotify is rate limiting, try again in {s} s")
             }
-            ApiError::Forbidden(e) => write!(f, "accès refusé par Spotify ({e})"),
-            ApiError::NotFound => write!(f, "introuvable"),
-            ApiError::Status(c, e) => write!(f, "erreur Spotify {c} ({e})"),
-            ApiError::Parse(e) => write!(f, "réponse inattendue ({e})"),
+            ApiError::Forbidden(e) => write!(f, "access denied by Spotify ({e})"),
+            ApiError::NotFound => write!(f, "not found"),
+            ApiError::Status(c, e) => write!(f, "Spotify error {c} ({e})"),
+            ApiError::Parse(e) => write!(f, "unexpected response ({e})"),
         }
     }
 }

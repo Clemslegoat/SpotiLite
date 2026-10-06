@@ -91,11 +91,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
 fn describe(error: &webview2_com::Error) -> String {
     match error {
-        webview2_com::Error::WindowsError(e) if e.code().0 as u32 == 0x8007_0002 => format!(
-            "le composant Microsoft Edge WebView2 est absent de ce PC : installez-le depuis {RUNTIME_URL}"
-        ),
-        webview2_com::Error::WindowsError(e) => format!("WebView2 : {} ({:#010x})", e.message(), e.code().0),
-        other => format!("WebView2 : {other}"),
+        webview2_com::Error::WindowsError(e) if e.code().0 as u32 == 0x8007_0002 => {
+            format!("Microsoft Edge WebView2 is not installed on this PC: get it from {RUNTIME_URL}")
+        }
+        webview2_com::Error::WindowsError(e) => format!("WebView2: {} ({:#010x})", e.message(), e.code().0),
+        other => format!("WebView2: {other}"),
     }
 }
 
@@ -105,9 +105,9 @@ fn host(setup: Setup) -> Result<(), String> {
 
     // The page is served from a folder mapped to https://spotilite.example.
     let page_dir = dir.join("page");
-    std::fs::create_dir_all(&page_dir).map_err(|e| format!("dossier {} : {e}", page_dir.display()))?;
+    std::fs::create_dir_all(&page_dir).map_err(|e| format!("folder {}: {e}", page_dir.display()))?;
     crate::config::write_atomic(&page_dir.join("player.html"), PLAYER_HTML.as_bytes())
-        .map_err(|e| format!("page du lecteur : {e}"))?;
+        .map_err(|e| format!("player page: {e}"))?;
 
     // SAFETY: plain Win32 window creation on this thread.
     let hwnd = unsafe {
@@ -134,7 +134,7 @@ fn host(setup: Setup) -> Result<(), String> {
             Some(HINSTANCE(instance.0)),
             None,
         )
-        .map_err(|e| format!("fenêtre : {e}"))?
+        .map_err(|e| format!("window: {e}"))?
     };
 
     let result = host_in_window(hwnd, &dir, &arguments, volume, &commands, &events, debug);
@@ -245,10 +245,7 @@ fn register_handlers(webview: &ICoreWebView2, events: &Events) -> windows::core:
                     COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED,
                 ];
                 if fatal.contains(&kind) {
-                    send(EngineEvent::Failed(format!(
-                        "un processus WebView2 s'est arrêté (type {})",
-                        kind.0
-                    )));
+                    send(EngineEvent::Failed(format!("a WebView2 process stopped (kind {})", kind.0)));
                 } else {
                     send(EngineEvent::Log(format!("WebView2 helper process exited (kind {})", kind.0)));
                 }
@@ -324,7 +321,7 @@ fn host_in_window(
         }
         let mapping = webview
             .cast::<ICoreWebView2_3>()
-            .map_err(|_| "WebView2 est trop ancien : mettez Microsoft Edge WebView2 à jour".to_string())?;
+            .map_err(|_| "WebView2 is too old: update Microsoft Edge WebView2".to_string())?;
         let folder = HSTRING::from(dir.join("page").as_os_str());
         mapping
             .SetVirtualHostNameToFolderMapping(

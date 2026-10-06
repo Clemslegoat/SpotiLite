@@ -43,24 +43,39 @@ struct Wake {
     when: Instant,
 }
 
-pub fn run<A: App, F: FnOnce(&egui::Context, &Window) -> A>(
+/// Wakes the application up from any thread (backend events, media keys), even
+/// while the window is minimized. `egui::Context::request_repaint` cannot do it
+/// then: egui forwards a request only when it is sooner than the pending one, and
+/// without frames the first request stays pending forever, swallowing the next.
+#[derive(Clone)]
+pub struct Waker(EventLoopProxy<Wake>);
+
+impl Waker {
+    pub fn wake(&self) {
+        let _ = self.0.send_event(Wake { when: Instant::now() });
+    }
+}
+
+pub fn run<A: App, F: FnOnce(&egui::Context, &Window, Waker) -> A>(
     options: Options,
     create: F,
 ) -> Result<(), String> {
     let event_loop = EventLoop::<Wake>::with_user_event().build().map_err(|e| e.to_string())?;
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
+    let waker = Waker(proxy.clone());
     let ctx = egui::Context::default();
-    // Repaint requests can come from any thread (the backend, media keys).
+    // Repaint requests of the interface itself (animations, delayed repaints).
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(Wake { when: Instant::now() + info.delay });
     });
-    let mut runner = Runner { options, ctx, create: Some(create), window: None, next_repaint: None };
+    let mut runner = Runner { options, ctx, waker, create: Some(create), window: None, next_repaint: None };
     event_loop.run_app(&mut runner).map_err(|e| e.to_string())
 }
 
 struct Runner<A, F> {
     options: Options,
     ctx: egui::Context,
+    waker: Waker,
     create: Option<F>,
     window: Option<Running<A>>,
     next_repaint: Option<Instant>,
@@ -77,7 +92,7 @@ struct Running<A> {
     window: Rc<Window>,
 }
 
-impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> ApplicationHandler<Wake> for Runner<A, F> {
+impl<A: App, F: FnOnce(&egui::Context, &Window, Waker) -> A> ApplicationHandler<Wake> for Runner<A, F> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -158,7 +173,7 @@ impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> ApplicationHandler<Wake> f
     }
 }
 
-impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> Runner<A, F> {
+impl<A: App, F: FnOnce(&egui::Context, &Window, Waker) -> A> Runner<A, F> {
     fn open(&self, event_loop: &ActiveEventLoop, create: F) -> Result<Running<A>, String> {
         let builder = egui::ViewportBuilder::default()
             .with_title(self.options.title)
@@ -191,7 +206,7 @@ impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> Runner<A, F> {
         );
         let mut info = ViewportInfo::default();
         egui_winit::update_viewport_info(&mut info, &self.ctx, &window, true);
-        let app = create(&self.ctx, &window);
+        let app = create(&self.ctx, &window, self.waker.clone());
         // softbuffer pixels are 0x00RRGGBB, i.e. B, G, R, X in memory. The rasterizer
         // draws straight into them: no intermediate canvas kept in memory.
         let renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra)

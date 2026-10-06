@@ -55,11 +55,11 @@ pub enum AuthError {
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AuthError::Bind(e) => write!(f, "impossible d'écouter le retour de connexion ({e})"),
-            AuthError::Cancelled => write!(f, "connexion annulée"),
-            AuthError::TimedOut => write!(f, "délai de connexion dépassé"),
-            AuthError::Denied(e) => write!(f, "autorisation refusée ({e})"),
-            AuthError::Exchange(e) => write!(f, "échange du jeton impossible ({e})"),
+            AuthError::Bind(e) => write!(f, "cannot listen for the login redirect ({e})"),
+            AuthError::Cancelled => write!(f, "login cancelled"),
+            AuthError::TimedOut => write!(f, "login timed out"),
+            AuthError::Denied(e) => write!(f, "authorization denied ({e})"),
+            AuthError::Exchange(e) => write!(f, "token exchange failed ({e})"),
         }
     }
 }
@@ -211,15 +211,15 @@ impl AuthFlow {
         let result = if let Some(error) = param("error") {
             Err(AuthError::Denied(error))
         } else if param("state").as_deref() != Some(self.state.as_str()) {
-            Err(AuthError::Denied("state invalide".into()))
+            Err(AuthError::Denied("invalid state".into()))
         } else if let Some(code) = param("code") {
             Ok(code)
         } else {
-            Err(AuthError::Denied("code absent".into()))
+            Err(AuthError::Denied("missing code".into()))
         };
         let (title, text) = match &result {
-            Ok(_) => ("Connecté", "Vous pouvez fermer cet onglet et revenir à SpotiLite."),
-            Err(_) => ("Échec de la connexion", "Revenez à SpotiLite pour réessayer."),
+            Ok(_) => ("Connected", "You can close this tab and go back to SpotiLite."),
+            Err(_) => ("Login failed", "Go back to SpotiLite to try again."),
         };
         let page = callback_page(title, text);
         let response = format!(
@@ -316,7 +316,7 @@ async fn post_token(
 
 fn callback_page(title: &str, text: &str) -> String {
     format!(
-        "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><title>SpotiLite</title>\
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>SpotiLite</title>\
 <style>body{{margin:0;height:100vh;display:grid;place-items:center;background:#000;color:#fff;\
 font:16px 'Segoe UI',system-ui,sans-serif}}h1{{font-weight:600;font-size:22px;margin:0 0 8px}}\
 p{{margin:0;color:#8a8a8a}}</style></head><body><div><h1>{title}</h1><p>{text}</p></div></body></html>"
@@ -402,6 +402,6 @@ mod tests {
         });
         let code = flow.wait_for_code(&Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(code, "xyz");
-        assert!(client.join().unwrap().contains("Connecté"));
+        assert!(client.join().unwrap().contains("Connected"));
     }
 }

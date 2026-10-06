@@ -4,6 +4,7 @@
 
 #[cfg(not(windows))]
 use crate::model::Track;
+use crate::window::Waker;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -25,7 +26,7 @@ pub struct MediaKeys;
 
 #[cfg(not(windows))]
 impl MediaKeys {
-    pub fn new(_window: &winit::window::Window, _ctx: egui::Context) -> Self {
+    pub fn new(_window: &winit::window::Window, _waker: Waker) -> Self {
         Self
     }
 
@@ -49,7 +50,7 @@ mod windows_impl {
         SeekDirection,
     };
 
-    use super::MediaAction;
+    use super::{MediaAction, Waker};
     use crate::model::Track;
 
     pub struct MediaKeys {
@@ -60,7 +61,7 @@ mod windows_impl {
     }
 
     impl MediaKeys {
-        pub fn new(window: &winit::window::Window, ctx: egui::Context) -> Self {
+        pub fn new(window: &winit::window::Window, waker: Waker) -> Self {
             let (tx, rx) = channel();
             let hwnd = window.window_handle().ok().and_then(|h| match h.as_raw() {
                 RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut std::ffi::c_void),
@@ -88,7 +89,7 @@ mod windows_impl {
                         };
                         if let Some(action) = action {
                             let _ = tx.send(action);
-                            ctx.request_repaint();
+                            waker.wake();
                         }
                     })
                     .ok()?;

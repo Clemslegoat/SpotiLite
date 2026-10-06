@@ -17,4 +17,6 @@ The executable is not code-signed: if SmartScreen warns, choose *More info* → 
 - CPU-rendered interface (no GPU driver), lean player profile that sleeps after 5 minutes of pause.
 - Home page with recently played tracks, followed artists, artist pages, cover-colored headers and
   player bar, custom title bar, redrawn icons.
-- Queue editing, add to / remove from your playlists, media keys and Windows media flyout.
+- Queue editing, add to / remove from your playlists, media keys and Windows media flyout (also
+  while minimized).
+- English interface; sizes in MB or Mo (Settings → Display).

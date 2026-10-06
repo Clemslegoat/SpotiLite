@@ -56,14 +56,12 @@ xychart-beta
 - **Look**: AMOLED black theme with a white accent, rounded panels, cover-colored headers and
   player bar, hand-drawn vector icons, custom title bar.
 - **Windows integration**: media keys, headset buttons, Windows media flyout and lock screen
-  (System Media Transport Controls), Windows 11 rounded corners and snapping.
+  (System Media Transport Controls), also while minimized; Windows 11 rounded corners and snapping.
 - **Data saving**: gzip API responses, library cached on disk and only re-downloaded when it
   changes (playlist snapshots), small covers that can be turned off.
 - **Privacy**: no account password ever goes through SpotiLite (OAuth in the browser), credentials
   encrypted with Windows DPAPI, no telemetry.
 - **Portable mode**: create a `spotilite-data` folder next to the executable.
-
-The interface is in French.
 
 ## Requirements
 

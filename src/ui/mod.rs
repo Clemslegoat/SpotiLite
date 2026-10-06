@@ -23,6 +23,7 @@ use crate::model::{
     AlbumSummary, ArtistSummary, ArtistsPage, PlaylistSummary, Repeat, SearchResults, Track, ViewKey,
 };
 use crate::sys;
+use crate::window::Waker;
 use theme::Palette;
 
 /// Recently played tracks kept for the home page.
@@ -42,6 +43,17 @@ fn load_recent(paths: &Paths) -> Vec<Track> {
 /// Pages kept in memory for instant back-navigation; older ones are dropped
 /// (they come back from the disk cache without any download).
 const MAX_PAGES: usize = 12;
+/// Demo album covers: gradient start and end colors.
+#[cfg(debug_assertions)]
+const DEMO_COVERS: [(egui::Color32, egui::Color32); 7] = [
+    (egui::Color32::from_rgb(255, 94, 98), egui::Color32::from_rgb(255, 170, 100)),
+    (egui::Color32::from_rgb(67, 206, 162), egui::Color32::from_rgb(24, 90, 157)),
+    (egui::Color32::from_rgb(142, 45, 226), egui::Color32::from_rgb(60, 20, 140)),
+    (egui::Color32::from_rgb(236, 72, 153), egui::Color32::from_rgb(59, 91, 230)),
+    (egui::Color32::from_rgb(15, 130, 130), egui::Color32::from_rgb(80, 200, 120)),
+    (egui::Color32::from_rgb(245, 175, 25), egui::Color32::from_rgb(210, 50, 50)),
+    (egui::Color32::from_rgb(55, 65, 90), egui::Color32::from_rgb(140, 155, 175)),
+];
 const MAX_TEXTURES: usize = 48;
 
 pub enum Page {
@@ -204,6 +216,7 @@ impl App {
     pub fn new(
         ctx: &egui::Context,
         window: &winit::window::Window,
+        waker: Waker,
         paths: Paths,
         settings: Settings,
     ) -> Self {
@@ -214,8 +227,8 @@ impl App {
         ctx.set_zoom_factor(settings.ui_scale);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
 
-        let backend = Backend::spawn(ctx.clone(), paths.clone(), settings.clone());
-        let media = MediaKeys::new(window, ctx.clone());
+        let backend = Backend::spawn(waker.clone(), paths.clone(), settings.clone());
+        let media = MediaKeys::new(window, waker);
         let player = Player { shuffle: settings.shuffle, repeat: settings.repeat, ..Player::default() };
         Self {
             backend,
@@ -257,7 +270,7 @@ impl App {
             usage: (0, 0),
             memory: sys::memory(),
             memory_at: None,
-            engine_status: "Arrêté".into(),
+            engine_status: "Stopped".into(),
             engine_memory: 0,
             cache_size: None,
             media,
@@ -275,15 +288,36 @@ impl App {
             return self;
         }
         self.demo = true;
-        self.user = "Démo".into();
+        self.user = "Alex".into();
         self.user_id = "demo".into();
-        let names =
-            ["Lueurs", "Minuit passé", "Rivages", "Sur le fil", "Horizon bas", "Nocturne", "Papier", "Écho"];
-        let artists = ["Nora Vale", "Les Ondes", "Kaito", "Mélodie Brune", "Atlas Sud"];
+        let names = [
+            "Afterglow",
+            "Past Midnight",
+            "Shorelines",
+            "On the Wire",
+            "Low Horizon",
+            "Nocturne",
+            "Paper Moon",
+            "Echoes",
+            "Golden Hour",
+            "Slow Motion",
+            "City Lights",
+            "Undertow",
+            "Wildflower",
+            "Static",
+            "Northbound",
+            "Glass Houses",
+            "Daydream",
+            "Satellites",
+            "Half Light",
+            "Open Water",
+        ];
+        let versions = ["", " (Acoustic)", " (Live)", " (Remix)", " (Demo)", " (Radio Edit)"];
+        let artists = ["Nora Vale", "The Tides", "Kaito", "Mila Brown", "Atlas South"];
         let tracks: Vec<Track> = (0..120)
             .map(|i| Track {
                 id: format!("demo{i}"),
-                name: format!("{} {}", names[i % names.len()], i / names.len() + 1),
+                name: format!("{}{}", names[i % names.len()], versions[i / names.len()]),
                 artists: vec![ArtistRef {
                     id: format!("a{}", i % 5),
                     name: artists[i % artists.len()].into(),
@@ -291,29 +325,51 @@ impl App {
                 album: format!("Album {}", i % 9 + 1),
                 album_id: format!("al{}", i % 9),
                 duration_ms: 150_000 + (i as u32 * 7919) % 120_000,
-                image: Some(
-                    ["demo-cover", "demo-artist-0", "demo-artist-1", "demo-artist-2"][i % 9 % 4].into(),
-                ),
+                image: Some(format!("demo-cover-{}", i % DEMO_COVERS.len())),
                 playable: i % 17 != 16,
             })
             .collect();
-        self.playlists =
-            ["Découvertes", "Focus", "Route", "Chill du dimanche", "Années 2000", "Jazz tranquille"]
-                .iter()
-                .enumerate()
-                .map(|(i, name)| PlaylistSummary {
-                    id: format!("p{i}"),
-                    name: (*name).into(),
-                    owner: "demo".into(),
-                    total: 40 + i as u32 * 13,
-                    snapshot_id: String::new(),
-                    image: Some(
-                        ["demo-cover", "demo-artist-0", "demo-artist-1", "demo-artist-2"][i % 4].into(),
-                    ),
-                    owner_id: "demo".into(),
-                    collaborative: false,
-                })
-                .collect();
+        self.playlists = ["Discoveries", "Focus", "Road Trip", "Sunday Chill", "2000s Hits", "Quiet Jazz"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| PlaylistSummary {
+                id: format!("p{i}"),
+                name: (*name).into(),
+                owner: "demo".into(),
+                total: 40 + i as u32 * 13,
+                snapshot_id: String::new(),
+                image: Some(format!("demo-cover-{}", (i + 1) % DEMO_COVERS.len())),
+                owner_id: "demo".into(),
+                collaborative: false,
+            })
+            .collect();
+        // Album covers: two-color gradients with a soft light.
+        for (i, (from, to)) in DEMO_COVERS.iter().enumerate() {
+            let image = egui::ColorImage::new(
+                [64, 64],
+                (0..64 * 64)
+                    .map(|p| {
+                        let (x, y) = ((p % 64) as f32 / 63.0, (p / 64) as f32 / 63.0);
+                        let t = (x * 0.4 + y * 0.6).clamp(0.0, 1.0);
+                        let glow =
+                            (1.0 - ((x - 0.3).powi(2) + (y - 0.25).powi(2)).sqrt() * 2.2).max(0.0) * 0.18;
+                        let mix = |a: u8, b: u8| {
+                            let v = f32::from(a) + (f32::from(b) - f32::from(a)) * t;
+                            (v + (255.0 - v) * glow) as u8
+                        };
+                        egui::Color32::from_rgb(
+                            mix(from.r(), to.r()),
+                            mix(from.g(), to.g()),
+                            mix(from.b(), to.b()),
+                        )
+                    })
+                    .collect(),
+            );
+            let key = format!("demo-cover-{i}");
+            self.covers.tints.insert(key.clone(), ambient::tint_of(&image));
+            let texture = ctx.load_texture(key.clone(), image, TextureOptions::LINEAR);
+            self.covers.textures.insert(key, texture);
+        }
         // A synthetic cover (dusk gradient) to show the player bar colors.
         let demo_cover = "demo-cover".to_string();
         let image = egui::ColorImage::new(
@@ -350,7 +406,7 @@ impl App {
         self.pages.insert(
             ViewKey::Liked,
             Page::Tracks {
-                title: "Titres likés".into(),
+                title: "Liked Songs".into(),
                 subtitle: String::new(),
                 cover: None,
                 tracks: Arc::new(tracks.clone()),
@@ -359,14 +415,14 @@ impl App {
         self.pages.insert(
             ViewKey::Playlist("p0".into()),
             Page::Tracks {
-                title: "Découvertes".into(),
-                subtitle: "Démo".into(),
+                title: "Discoveries".into(),
+                subtitle: "Alex".into(),
                 cover: Some("demo-cover".into()),
                 tracks: Arc::new(tracks.iter().skip(3).step_by(3).take(30).cloned().collect()),
             },
         );
-        self.recent = Arc::new(tracks.iter().skip(4).step_by(5).take(12).cloned().collect());
-        self.engine_status = "Prêt · DRM Widevine".into();
+        self.recent = Arc::new(tracks[3..8].to_vec());
+        self.engine_status = "Ready · Widevine DRM".into();
         self.cache_size = Some(26_400_000);
         self.usage = (2_300_000, 38_700_000);
         self.engine_memory = 112 * 1024 * 1024;
@@ -392,7 +448,7 @@ impl App {
             covers.textures.insert(key.clone(), ctx.load_texture(key.clone(), image, TextureOptions::LINEAR));
             key
         };
-        let followed: Vec<ArtistSummary> = ["Atlas Sud", "Kaito", "Les Ondes"]
+        let followed: Vec<ArtistSummary> = ["Atlas South", "Kaito", "The Tides"]
             .iter()
             .enumerate()
             .map(|(i, name)| ArtistSummary {
@@ -411,7 +467,7 @@ impl App {
         let albums = (0..7)
             .map(|i| AlbumSummary {
                 id: format!("al{i}"),
-                name: ["Rivages", "Marées", "Phares", "Écume", "Brise", "Sable", "Vagues"][i].into(),
+                name: ["Shorelines", "Tides", "Lighthouses", "Sea Foam", "Breeze", "Sand", "Waves"][i].into(),
                 artists: "Kaito".into(),
                 year: format!("{}", 2025 - i * 2),
                 total_tracks: 6 + i as u32 * 2,
@@ -438,7 +494,9 @@ impl App {
                 "playlist" => ViewKey::Playlist("p0".into()),
                 _ => ViewKey::Liked,
             };
-            self.history.push(ViewKey::Liked);
+            if self.view != ViewKey::Home {
+                self.history.push(ViewKey::Liked);
+            }
         }
         self
     }

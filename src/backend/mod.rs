@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::config::{Paths, Settings};
+use crate::config::{ByteUnits, Paths, Settings};
 use crate::model::{
     AlbumSummary, ArtistSummary, ArtistsPage, PlaylistSummary, Repeat, SearchResults, Track, ViewKey,
     artists_by_count,
 };
 use crate::queue::Queue;
+use crate::window::Waker;
 pub use auth::AppCredentials;
 use auth::{AuthFlow, OAuthToken};
 use engine::{EngineCommand, EngineEvent, ErrorKind, PlayerState, Profile, Progress, Tracker};
@@ -213,13 +214,13 @@ pub enum Event {
 #[derive(Clone)]
 struct UiTx {
     tx: std::sync::mpsc::Sender<Event>,
-    ctx: egui::Context,
+    waker: Waker,
 }
 
 impl UiTx {
     fn send(&self, event: Event) {
         let _ = self.tx.send(event);
-        self.ctx.request_repaint();
+        self.waker.wake();
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -234,10 +235,10 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn spawn(ctx: egui::Context, paths: Paths, settings: Settings) -> Self {
+    pub fn spawn(waker: Waker, paths: Paths, settings: Settings) -> Self {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let ui = UiTx { tx: ev_tx, ctx };
+        let ui = UiTx { tx: ev_tx, waker };
         let thread = std::thread::Builder::new()
             .name("spotilite-core".into())
             .spawn(move || {
@@ -595,7 +596,7 @@ impl Core {
             Err(e) => {
                 self.send_app_status();
                 return self.ui.error(format!(
-                    "Impossible d'écouter sur le port {} : {e}. Changez le port dans les réglages (et dans le tableau de bord Spotify).",
+                    "Cannot listen on port {}: {e}. Change the port in Settings (and in the Spotify dashboard).",
                     self.settings.redirect_port
                 ));
             }
@@ -653,14 +654,14 @@ impl Core {
         tokio::spawn(async move {
             match api.remove_from_playlist(&playlist_id, &track.id).await {
                 Ok(()) => {
-                    ui.send(Event::Info(format!("« {} » retiré de « {playlist_name} »", track.name)));
+                    ui.send(Event::Info(format!("Removed “{}” from “{playlist_name}”", track.name)));
                     let _ = internal.send(Internal::RemovedFromPlaylist(playlist_id, track.id));
                 }
                 Err(e) if e.is_missing_scope() => {
                     let _ = internal.send(Internal::Scopes(vec!["playlist-modify-private"], true));
                 }
-                Err(ApiError::Forbidden(_)) => ui.error("Spotify refuse de modifier cette playlist."),
-                Err(e) => ui.error(format!("Retrait de « {playlist_name} » impossible : {e}")),
+                Err(ApiError::Forbidden(_)) => ui.error("Spotify does not allow changes to this playlist."),
+                Err(e) => ui.error(format!("Could not remove from “{playlist_name}”: {e}")),
             }
         });
     }
@@ -689,15 +690,15 @@ impl Core {
         tokio::spawn(async move {
             match api.add_to_playlist(&playlist_id, &track.id).await {
                 Ok(()) => {
-                    ui.send(Event::Info(format!("« {} » ajouté à « {playlist_name} »", track.name)));
+                    ui.send(Event::Info(format!("Added “{}” to “{playlist_name}”", track.name)));
                     let _ = internal.send(Internal::PlaylistsChanged);
                 }
                 // Authorizations given before this menu existed lack the scope.
                 Err(e) if e.is_missing_scope() => {
                     let _ = internal.send(Internal::Scopes(vec!["playlist-modify-private"], true));
                 }
-                Err(ApiError::Forbidden(_)) => ui.error("Spotify refuse de modifier cette playlist."),
-                Err(e) => ui.error(format!("Ajout à « {playlist_name} » impossible : {e}")),
+                Err(ApiError::Forbidden(_)) => ui.error("Spotify does not allow changes to this playlist."),
+                Err(e) => ui.error(format!("Could not add to “{playlist_name}”: {e}")),
             }
         });
     }
@@ -750,8 +751,8 @@ impl Core {
             self.playback_auth_asked = true;
             self.ui.send(Event::Notice {
                 key: "auth",
-                text: "SpotiLite a besoin d'une autorisation supplémentaire de votre application Spotify : \
-                       acceptez-la dans le navigateur qui vient de s'ouvrir."
+                text: "SpotiLite needs one more permission from your Spotify app: \
+                       accept it in the browser that just opened."
                     .into(),
                 error: false,
             });
@@ -760,8 +761,8 @@ impl Core {
         self.send_app_status();
         self.ui.send(Event::Notice {
             key: "auth",
-            text: "Autorisation à renouveler : Réglages → « Autoriser ». Si Spotify refuse encore la \
-                   lecture, cochez « Web Playback SDK » dans votre application (tableau de bord Spotify)."
+            text: "Authorization to renew: Settings → Authorize. If Spotify still refuses playback, \
+                   tick Web Playback SDK in your app (Spotify dashboard)."
                 .into(),
             error: true,
         });
@@ -787,7 +788,7 @@ impl Core {
             Command::ReconnectApp => match self.api.saved_app() {
                 Some(app) => {
                     if self.app_connected {
-                        self.ui.send(Event::Info("Acceptez l'autorisation dans le navigateur.".into()));
+                        self.ui.send(Event::Info("Accept the authorization in the browser.".into()));
                     }
                     self.start_app_login(app);
                 }
@@ -867,7 +868,7 @@ impl Core {
                     self.queue.enqueue(track);
                     self.send_queue();
                 }
-                self.ui.send(Event::Info(format!("« {name} » ajouté à la file")));
+                self.ui.send(Event::Info(format!("Added “{name}” to the queue")));
             }
             Command::RemoveFromQueue { index, track_id } => {
                 if self.remote.is_none() && self.queue.remove_upcoming(index, &track_id) {
@@ -893,7 +894,7 @@ impl Core {
         match msg {
             // A cancelled flow was replaced or abandoned on purpose: its handle is
             // already gone and must not clear the one of a newer flow.
-            Internal::AppToken(Err(e)) if e.contains("annulée") => {}
+            Internal::AppToken(Err(e)) if e.contains("cancelled") => {}
             Internal::AppToken(result) => {
                 self.app_login = None;
                 match result {
@@ -905,7 +906,7 @@ impl Core {
                         self.api.connect(app, token).await;
                         self.app_connected = true;
                         self.refreshed.clear();
-                        self.ui.send(Event::Info("Application Spotify connectée.".into()));
+                        self.ui.send(Event::Info("Spotify app connected.".into()));
                         if first {
                             self.after_connect();
                         } else {
@@ -954,7 +955,7 @@ impl Core {
                 }
             }
             Internal::TokenFailed(e) => {
-                self.ui.error(format!("Lecture : jeton d'accès indisponible ({e})."));
+                self.ui.error(format!("Playback: access token unavailable ({e})."));
             }
             Internal::LikedIds(ids) => self.liked_ids = Some(ids),
             Internal::Playlists(list) => {
@@ -976,8 +977,7 @@ impl Core {
         if self.api.take_lost() {
             self.app_connected = false;
             self.stop_engine();
-            self.ui
-                .error("L'autorisation de votre application Spotify a expiré : cliquez sur « Reconnecter ».");
+            self.ui.error("Your Spotify app authorization has expired: click Reconnect in Settings.");
             self.send_app_status();
         }
         if self.playing {
@@ -997,10 +997,10 @@ impl Core {
             {
                 self.stalled = self.load_generation;
                 if !self.compatible && !self.engine_played {
-                    return self.fall_back_to_compatible("rien ne démarre");
+                    return self.fall_back_to_compatible("nothing starts");
                 }
                 self.loaded = false;
-                self.ui.error("Spotify ne démarre pas la lecture. Réessayez dans un instant.");
+                self.ui.error("Spotify does not start playback. Try again in a moment.");
                 self.send_playback(false);
             }
             // Asleep after a pause: its WebView2 processes give their memory back.
@@ -1008,7 +1008,7 @@ impl Core {
                 log::info!("engine idle: stopped");
                 self.loaded = false;
                 self.stop_engine();
-                self.ui.send(Event::EngineStatus("En veille : il redémarre à la prochaine lecture".into()));
+                self.ui.send(Event::EngineStatus("Asleep: starts again on next play".into()));
                 self.send_playback(false);
             }
         }
@@ -1031,7 +1031,7 @@ impl Core {
         let covers_off = self.settings.show_covers && !new.show_covers;
         self.settings = new;
         if covers_off {
-            self.ui.send(Event::Info("Pochettes désactivées : plus aucune image téléchargée.".into()));
+            self.ui.send(Event::Info("Covers off: no more images downloaded.".into()));
         }
     }
 
@@ -1039,7 +1039,8 @@ impl Core {
         let before = self.store.size();
         self.store.clear();
         self.refreshed.clear();
-        self.ui.send(Event::Info(format!("Cache vidé ({}).", human_bytes(before))));
+        self.ui
+            .send(Event::Info(format!("Cache cleared ({}).", human_bytes(before, self.settings.byte_units))));
         self.measure_cache();
     }
 
@@ -1341,8 +1342,7 @@ impl Core {
             return true;
         }
         if !self.app_connected {
-            self.ui
-                .error("Connectez votre application Spotify pour écouter (Réglages → Application Spotify).");
+            self.ui.error("Connect your Spotify app to listen (Settings → Account).");
             return false;
         }
         self.engine_id += 1;
@@ -1354,7 +1354,7 @@ impl Core {
         self.engine_played = false;
         self.drm.clear();
         self.last_active = Instant::now();
-        self.ui.send(Event::EngineStatus("Démarrage…".into()));
+        self.ui.send(Event::EngineStatus("Starting…".into()));
         self.engine =
             Some(engine::Engine::start(self.paths.webview(), self.settings.volume, profile, move |event| {
                 let _ = internal.send(Internal::Engine(id, event));
@@ -1366,7 +1366,7 @@ impl Core {
         if self.engine.take().is_some() {
             log::info!("engine stopped");
             self.ui.send(Event::EngineMemory(0));
-            self.ui.send(Event::EngineStatus("Arrêté".into()));
+            self.ui.send(Event::EngineStatus("Stopped".into()));
         }
         self.device_id = None;
         self.pending = None;
@@ -1387,7 +1387,7 @@ impl Core {
         self.playing = false;
         self.ui.send(Event::Notice {
             key: "engine",
-            text: "Le lecteur redémarre en mode compatible (un peu plus de mémoire sur ce PC).".into(),
+            text: "The player restarts in compatibility mode (a bit more memory on this PC).".into(),
             error: false,
         });
         self.play_pause();
@@ -1407,7 +1407,7 @@ impl Core {
             }
             EngineEvent::NotReady => {
                 self.device_id = None;
-                self.ui.send(Event::EngineStatus("Reconnexion à Spotify…".into()));
+                self.ui.send(Event::EngineStatus("Reconnecting to Spotify…".into()));
             }
             EngineEvent::NeedToken => {
                 let Some(sender) = self.engine.as_ref().map(engine::Engine::sender) else { return };
@@ -1464,7 +1464,7 @@ impl Core {
                         remote.started = false;
                     }
                     self.send_playback(false);
-                    self.ui.send(Event::Info("La lecture continue sur un autre appareil Spotify.".into()));
+                    self.ui.send(Event::Info("Playback continues on another Spotify device.".into()));
                 }
             }
             EngineEvent::Error(kind, message) => self.on_engine_error(kind, message),
@@ -1479,8 +1479,8 @@ impl Core {
                 };
                 if systems.is_empty() {
                     self.ui.error(
-                        "WebView2 ne propose aucun DRM (Widevine, PlayReady) sur ce PC : Spotify ne pourra rien lire. \
-                         Mettez Windows et Microsoft Edge WebView2 à jour.",
+                        "WebView2 offers no DRM (Widevine, PlayReady) on this PC: Spotify cannot play anything. \
+                         Update Windows and Microsoft Edge WebView2.",
                     );
                 }
                 self.send_engine_status();
@@ -1503,8 +1503,8 @@ impl Core {
                 self.playing = false;
                 self.loaded = false;
                 self.send_playback(false);
-                self.ui.error(format!("Lecteur : {message}"));
-                self.ui.send(Event::EngineStatus(format!("Arrêté : {message}")));
+                self.ui.error(format!("Player: {message}"));
+                self.ui.send(Event::EngineStatus(format!("Stopped: {message}")));
             }
         }
     }
@@ -1536,13 +1536,12 @@ impl Core {
     }
 
     fn send_engine_status(&self) {
-        let mut text =
-            if self.device_id.is_some() { "Prêt".to_string() } else { "Démarrage…".to_string() };
+        let mut text = if self.device_id.is_some() { "Ready".to_string() } else { "Starting…".to_string() };
         if !self.drm.is_empty() {
-            text.push_str(&format!(" · DRM {}", self.drm));
+            text.push_str(&format!(" · {} DRM", self.drm));
         }
         if self.compatible {
-            text.push_str(" · mode compatible");
+            text.push_str(" · compatibility mode");
         }
         self.ui.send(Event::EngineStatus(text));
     }
@@ -1576,39 +1575,40 @@ impl Core {
                 // right away; otherwise the application or the account is the cause.
                 self.check_playback_scopes(true);
                 self.ui.error(
-                    "Spotify refuse de connecter le lecteur. Vérifiez que « Web Playback SDK » est coché \
-                     dans votre application (tableau de bord Spotify → Settings → Edit) et que le compte est Premium.",
+                    "Spotify refuses to connect the player. Check that Web Playback SDK is ticked \
+                     in your app (Spotify dashboard → Settings → Edit) and that the account is Premium.",
                 );
                 true
             }
             ErrorKind::Account => {
-                self.ui.error("Spotify refuse ce compte au lecteur : un abonnement Premium est nécessaire.");
+                self.ui
+                    .error("Spotify refuses this account for playback: a Premium subscription is required.");
                 true
             }
             ErrorKind::Initialization => {
                 self.ui.error(format!(
-                    "Le lecteur de Spotify ne peut pas démarrer dans WebView2 ({message}). \
-                     Mettez Windows et Microsoft Edge WebView2 à jour."
+                    "Spotify's player cannot start in WebView2 ({message}). \
+                     Update Windows and Microsoft Edge WebView2."
                 ));
                 true
             }
             ErrorKind::Load => {
                 self.ui
-                    .error("Lecteur de Spotify injoignable (sdk.scdn.co) : vérifiez la connexion Internet.");
+                    .error("Spotify's player is unreachable (sdk.scdn.co): check your Internet connection.");
                 true
             }
             ErrorKind::Autoplay => {
-                self.ui.error("WebView2 a bloqué le démarrage du son : relancez la lecture.");
+                self.ui.error("WebView2 blocked the sound from starting: press play again.");
                 false
             }
             ErrorKind::Other => {
-                self.ui.error(format!("Lecteur : {message}"));
+                self.ui.error(format!("Player: {message}"));
                 false
             }
         };
         if fatal {
             self.stop_engine();
-            self.ui.send(Event::EngineStatus("Arrêté (erreur)".into()));
+            self.ui.send(Event::EngineStatus("Stopped (error)".into()));
         }
         self.playing = false;
         self.loaded = false;
@@ -1624,10 +1624,10 @@ impl Core {
         self.send_playback(false);
         if self.failure_streak >= 3 || self.remote.is_some() {
             self.failure_streak = 0;
-            return self.ui.error(format!("Lecture impossible ({message}) : lecture arrêtée."));
+            return self.ui.error(format!("Cannot play ({message}): playback stopped."));
         }
         let name = self.queue.current().map(|t| t.name.clone()).unwrap_or_default();
-        self.ui.error(format!("« {name} » : lecture impossible ({message}). Titre suivant…"));
+        self.ui.error(format!("“{name}” cannot be played ({message}). Next track…"));
         self.schedule_skip(Duration::from_millis(1500));
     }
 
@@ -1644,12 +1644,10 @@ impl Core {
             ApiError::NotFound => {
                 // The device is unknown to Spotify: start a fresh engine next time.
                 self.stop_engine();
-                self.ui.error("Spotify ne trouve pas le lecteur : relancez la lecture.");
+                self.ui.error("Spotify cannot find the player: press play again.");
             }
-            ApiError::NotConnected => {
-                self.ui.error("Connectez votre application Spotify (Réglages → Application Spotify).")
-            }
-            other => self.ui.error(format!("Lecture impossible : {other}")),
+            ApiError::NotConnected => self.ui.error("Connect your Spotify app (Settings → Account)."),
+            other => self.ui.error(format!("Cannot play: {other}")),
         }
     }
 
@@ -1674,7 +1672,7 @@ impl Core {
                     store.save("playlists", &list);
                     let _ = internal.send(Internal::Playlists(list));
                 }
-                Err(e) => ui.error(format!("Playlists : {e}")),
+                Err(e) => ui.error(format!("Playlists: {e}")),
             }
         });
     }
@@ -1700,7 +1698,7 @@ impl Core {
                 if let Some(c) = &cached {
                     ui.send(Event::Tracks {
                         view: view.clone(),
-                        title: "Titres likés".into(),
+                        title: "Liked Songs".into(),
                         subtitle: String::new(),
                         cover: None,
                         tracks: Arc::new(c.tracks.clone()),
@@ -1723,7 +1721,7 @@ impl Core {
                             if !unchanged {
                                 ui.send(Event::Tracks {
                                     view: view.clone(),
-                                    title: "Titres likés".into(),
+                                    title: "Liked Songs".into(),
                                     subtitle: String::new(),
                                     cover: None,
                                     tracks: Arc::new(tracks.clone()),
@@ -1792,7 +1790,7 @@ impl Core {
                         Err(e) if e.is_missing_scope() => artists_page(
                             &liked,
                             cached.unwrap_or_default(),
-                            Some("Autorisez SpotiLite à lire les artistes que vous suivez.".into()),
+                            Some("Allow SpotiLite to read the artists you follow.".into()),
                             true,
                         ),
                         Err(e) => {
@@ -1800,7 +1798,7 @@ impl Core {
                             artists_page(
                                 &liked,
                                 cached.unwrap_or_default(),
-                                Some(format!("Artistes suivis indisponibles pour le moment ({e}).")),
+                                Some(format!("Followed artists are unavailable right now ({e}).")),
                                 false,
                             )
                         }
@@ -1941,7 +1939,7 @@ impl Core {
             match &view {
                 ViewKey::Liked => store.load::<CachedTracks>("liked").map(|c| Event::Tracks {
                     view: view.clone(),
-                    title: "Titres likés".into(),
+                    title: "Liked Songs".into(),
                     subtitle: String::new(),
                     cover: None,
                     tracks: Arc::new(c.tracks),
@@ -1981,10 +1979,9 @@ impl Core {
             };
         match event {
             Some(event) => self.ui.send(event),
-            None => self.ui.send(Event::ViewFailed {
-                view,
-                message: "Connectez votre application Spotify pour charger ce contenu.".into(),
-            }),
+            None => self
+                .ui
+                .send(Event::ViewFailed { view, message: "Connect your Spotify app to load this.".into() }),
         }
     }
 
@@ -2025,7 +2022,7 @@ impl Core {
                 }
                 Err(e) => {
                     ui.send(Event::Liked { track_id: track.id.clone(), liked: !liked });
-                    ui.error(format!("« J'aime » non enregistré : {e}"));
+                    ui.error(format!("Like not saved: {e}"));
                 }
             }
         });
@@ -2074,14 +2071,13 @@ fn repeat_state(mode: Repeat) -> &'static str {
 fn app_error_hint(error: &str) -> String {
     let lower = error.to_lowercase();
     if lower.contains("invalid_client") || lower.contains("invalid client") {
-        "Client ID ou Client Secret incorrect : recopiez-les depuis les réglages de votre application Spotify.".into()
+        "Wrong Client ID or Client Secret: copy them again from your Spotify app's settings.".into()
     } else if lower.contains("redirect") {
-        "URI de redirection refusée : ajoutez exactement celle affichée par SpotiLite dans votre application Spotify.".into()
-    } else if lower.contains("délai") {
-        "Aucune réponse du navigateur : vérifiez l'URI de redirection de votre application puis réessayez."
-            .into()
+        "Redirect URI refused: add exactly the one SpotiLite shows to your Spotify app.".into()
+    } else if lower.contains("timed out") {
+        "No answer from the browser: check your app's redirect URI, then try again.".into()
     } else {
-        format!("Connexion de l'application impossible : {error}")
+        format!("Could not connect the app: {error}")
     }
 }
 
@@ -2119,20 +2115,27 @@ fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {
 }
 
 /// Size in French notation ("1,5 Mo").
-pub fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64, units: ByteUnits) -> String {
     let b = bytes as f64;
-    let text = if bytes == 0 {
-        "0 Ko".to_string()
-    } else if b < 1024.0 {
-        "< 1 Ko".to_string()
-    } else if b < 1024.0 * 1024.0 {
-        format!("{:.0} Ko", b / 1024.0)
-    } else if b < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} Mo", b / 1024.0 / 1024.0)
-    } else {
-        format!("{:.2} Go", b / 1024.0 / 1024.0 / 1024.0)
+    let (kilo, mega, giga) = match units {
+        ByteUnits::Bytes => ("KB", "MB", "GB"),
+        ByteUnits::Octets => ("Ko", "Mo", "Go"),
     };
-    text.replace('.', ",")
+    let text = if bytes == 0 {
+        format!("0 {kilo}")
+    } else if b < 1024.0 {
+        format!("< 1 {kilo}")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} {kilo}", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} {mega}", b / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2} {giga}", b / 1024.0 / 1024.0 / 1024.0)
+    };
+    match units {
+        ByteUnits::Bytes => text,
+        ByteUnits::Octets => text.replace('.', ","),
+    }
 }
 
 #[cfg(test)]
@@ -2149,16 +2152,17 @@ mod tests {
     #[test]
     fn explains_authorization_errors() {
         assert!(app_error_hint("400 : invalid_client").contains("Client Secret"));
-        assert!(app_error_hint("Illegal redirect_uri").contains("redirection"));
-        assert!(app_error_hint("autre").contains("autre"));
+        assert!(app_error_hint("Illegal redirect_uri").contains("Redirect URI"));
+        assert!(app_error_hint("other").contains("other"));
     }
 
     #[test]
     fn formats_sizes() {
-        assert_eq!(human_bytes(0), "0 Ko");
-        assert_eq!(human_bytes(512), "< 1 Ko");
-        assert_eq!(human_bytes(2048), "2 Ko");
-        assert_eq!(human_bytes(5 * 1024 * 1024 + 300 * 1024), "5,3 Mo");
+        assert_eq!(human_bytes(0, ByteUnits::Bytes), "0 KB");
+        assert_eq!(human_bytes(512, ByteUnits::Bytes), "< 1 KB");
+        assert_eq!(human_bytes(2048, ByteUnits::Bytes), "2 KB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 + 300 * 1024, ByteUnits::Bytes), "5.3 MB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 + 300 * 1024, ByteUnits::Octets), "5,3 Mo");
     }
 
     #[test]
