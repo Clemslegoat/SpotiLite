@@ -23,18 +23,11 @@ fn surface(p: &theme::Palette, outer: Margin, inner: Margin) -> Frame {
         .inner_margin(inner)
 }
 
-/// The application mark: three white level bars in a rounded black tile.
-pub(super) fn logo(ui: &Ui, center: egui::Pos2, size: f32, p: &theme::Palette) {
-    let tile = Rect::from_center_size(center, vec2(size, size));
-    ui.painter().rect_filled(tile, CornerRadius::same((size * 0.28) as u8), p.raised);
-    let unit = size / 64.0;
-    for (x, h) in [(18.0, 22.0), (29.0, 34.0), (40.0, 16.0)] {
-        let bar = Rect::from_min_max(
-            pos2(tile.left() + x * unit, tile.top() + (46.0 - h) * unit),
-            pos2(tile.left() + (x + 6.0) * unit, tile.top() + 46.0 * unit),
-        );
-        ui.painter().rect_filled(bar, CornerRadius::same((3.0 * unit) as u8), p.accent);
-    }
+/// The application mark (feather and sound waves), in white.
+pub(super) fn logo(ui: &Ui, center: egui::Pos2, size: f32, texture: egui::TextureId) {
+    let rect = Rect::from_center_size(center, vec2(size, size));
+    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    ui.painter().image(texture, rect, uv, Color32::WHITE);
 }
 
 // ----------------------------------------------------------------------------
@@ -44,7 +37,7 @@ pub fn splash(app: &mut App, ui: &mut Ui) {
     let p = app.palette;
     egui::CentralPanel::default().frame(Frame::new().fill(p.bg)).show(ui, |ui| {
         let center = ui.max_rect().center();
-        logo(ui, center - vec2(0.0, 30.0), 64.0, &p);
+        logo(ui, center - vec2(0.0, 30.0), 64.0, app.logo.id());
         ui.painter().text(
             center + vec2(0.0, 22.0),
             Align2::CENTER_CENTER,
@@ -308,8 +301,13 @@ fn welcome_page(app: &mut App, ui: &mut Ui) {
                 let fill = if response.hovered() { p.line } else { p.raised };
                 ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_CARD), fill);
                 let tile = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(42.0, 42.0));
-                ui.painter().rect_filled(tile, CornerRadius::same(10), p.surface);
-                widgets::paint_icon(ui.painter(), tile.shrink(12.0), *icon, p.text);
+                let art = if *view == ViewKey::Liked { app.liked_art(&ui.ctx().clone()) } else { None };
+                if art.is_some() {
+                    widgets::cover(ui, &p, tile, art, 10);
+                } else {
+                    ui.painter().rect_filled(tile, CornerRadius::same(10), p.surface);
+                    widgets::paint_icon(ui.painter(), tile.shrink(10.0), *icon, p.text);
+                }
                 paint_text(
                     ui,
                     pos2(tile.right() + 12.0, rect.center().y),
@@ -412,6 +410,7 @@ fn tracks_page(
     ui.add_space(10.0);
     let liked = view == ViewKey::Liked;
     let liked_key = super::ambient::LIKED.to_string();
+    let art = if liked { app.liked_art(&ui.ctx().clone()) } else { None };
     let (play, shuffle) = banner(
         app,
         ui,
@@ -420,7 +419,7 @@ fn tracks_page(
             title,
             detail: &detail,
             image: if liked { Some(&liked_key) } else { cover },
-            picture: if liked { Picture::Icon(Icon::Heart { filled: true }) } else { Picture::Cover },
+            picture: art.map_or(Picture::Cover, Picture::Art),
             play_hint: "Lecture",
         },
     );
@@ -492,8 +491,8 @@ enum Picture {
     Cover,
     /// The image in a circle (artists).
     Portrait,
-    /// An icon on the banner's colors (pages without a picture).
-    Icon(Icon),
+    /// A picture of the application (the liked tracks one).
+    Art(egui::TextureId),
 }
 
 struct Banner<'a> {
@@ -538,14 +537,7 @@ fn banner(app: &mut App, ui: &mut Ui, info: &Banner) -> (bool, bool) {
             let texture = if app.settings.show_covers { app.cover(info.image) } else { None };
             widgets::cover(ui, &p, tile, texture, 10);
         }
-        Picture::Icon(icon) => {
-            // A light violet tile (the color of the liked tracks banner), icon on top.
-            ui.painter().rect_filled(tile, CornerRadius::same(10), Color32::from_rgb(112, 86, 226));
-            let sheen = Rect::from_min_max(tile.min, pos2(tile.right(), tile.center().y));
-            let top = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
-            ui.painter().rect_filled(sheen, top, Color32::from_white_alpha(14));
-            widgets::paint_icon(ui.painter(), tile.shrink(38.0), icon, Color32::WHITE);
-        }
+        Picture::Art(texture) => widgets::cover(ui, &p, tile, Some(texture), 10),
     }
 
     // Buttons on the right, text in between.
@@ -1580,7 +1572,7 @@ fn setup_header(app: &App, ui: &mut Ui) {
     let p = app.palette;
     ui.add_space(30.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-    logo(ui, pos2(rect.left() + 22.0, rect.center().y), 44.0, &p);
+    logo(ui, pos2(rect.left() + 22.0, rect.center().y), 44.0, app.logo.id());
     paint_text(
         ui,
         pos2(rect.left() + 58.0, rect.center().y),
@@ -1818,4 +1810,48 @@ pub fn toasts(app: &App, ctx: &egui::Context) {
                 ui.add_space(8.0);
             }
         });
+}
+
+/// Every icon at several sizes (`SPOTILITE_DEMO_ICONS=1`, debug builds).
+#[cfg(debug_assertions)]
+pub fn icon_sheet(app: &mut App, ui: &mut Ui) {
+    let p = app.palette;
+    let icons = [
+        Icon::Play,
+        Icon::Pause,
+        Icon::Prev,
+        Icon::Next,
+        Icon::Shuffle,
+        Icon::Repeat { one: false },
+        Icon::Repeat { one: true },
+        Icon::Heart { filled: false },
+        Icon::Heart { filled: true },
+        Icon::Volume { level: 0 },
+        Icon::Volume { level: 1 },
+        Icon::Volume { level: 2 },
+        Icon::Queue,
+        Icon::Back,
+        Icon::Refresh,
+        Icon::Search,
+        Icon::Disc,
+        Icon::Library,
+        Icon::Artist,
+        Icon::Settings,
+    ];
+    egui::CentralPanel::default().frame(Frame::new().fill(p.bg).inner_margin(Margin::same(16))).show(
+        ui,
+        |ui| {
+            for size in [16.0_f32, 24.0, 36.0, 64.0] {
+                ui.horizontal_wrapped(|ui| {
+                    for icon in icons {
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(size.max(28.0), size.max(28.0)), Sense::hover());
+                        let rect = Rect::from_center_size(rect.center(), vec2(size, size));
+                        widgets::paint_icon(ui.painter(), rect, icon, p.text);
+                    }
+                });
+                ui.add_space(10.0);
+            }
+        },
+    );
 }

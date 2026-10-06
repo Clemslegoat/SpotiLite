@@ -155,6 +155,9 @@ pub struct App {
     reveal_selected: bool,
     player: Player,
     covers: Covers,
+    /// The logo in white (128 px), and the liked tracks picture (loaded when shown).
+    logo: TextureHandle,
+    liked_art: Option<TextureHandle>,
     toasts: Vec<Toast>,
     usage: (u64, u64),
     memory: sys::Memory,
@@ -222,6 +225,8 @@ impl App {
             reveal_selected: false,
             player,
             covers: Covers::default(),
+            logo: ctx.load_texture("logo", crate::logo::image(), TextureOptions::LINEAR),
+            liked_art: None,
             toasts: Vec::new(),
             usage: (0, 0),
             memory: sys::memory(),
@@ -575,6 +580,22 @@ impl App {
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
 
+    /// The liked tracks picture (a white heart on a violet to mint gradient),
+    /// decoded the first time it is shown; its colors also paint the banner.
+    fn liked_art(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        static ART: &[u8] = include_bytes!("../../assets/liked.jpg");
+        if self.liked_art.is_none() || !self.covers.tints.contains_key(ambient::LIKED) {
+            let rgba = image::load_from_memory(ART).ok()?.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            self.covers.tints.insert(ambient::LIKED.to_string(), ambient::tint_of(&image));
+            if self.liked_art.is_none() {
+                self.liked_art = Some(ctx.load_texture("liked", image, TextureOptions::LINEAR));
+            }
+        }
+        self.liked_art.as_ref().map(TextureHandle::id)
+    }
+
     /// Blurred gradient of the current track's cover, for the player bar.
     fn player_ambient(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
         let url = self.player.now.as_ref()?.image.clone()?;
@@ -592,7 +613,8 @@ impl App {
             return Some(texture.id());
         }
         if url == ambient::LIKED && !self.covers.tints.contains_key(url) {
-            self.covers.tints.insert(url.clone(), ambient::liked_tint());
+            // The colors come from the picture.
+            self.liked_art(ctx);
         }
         let Some(tint) = self.covers.tints.get(url) else {
             // Arrives with the image itself.
@@ -809,6 +831,7 @@ impl App {
             self.covers.order.clear();
             self.covers.requested.clear();
             self.covers.ambient = Default::default();
+            self.liked_art = None;
             sys::trim_working_set();
         }
         self.minimized = minimized;
@@ -865,7 +888,12 @@ impl crate::window::App for App {
             self.settings.window_size = [rect.width() * ctx.zoom_factor(), rect.height() * ctx.zoom_factor()];
         }
         let palette = self.palette;
-        titlebar::show(ui, &palette, |ui, center, size| views::logo(ui, center, size, &palette));
+        let logo = self.logo.id();
+        titlebar::show(ui, &palette, |ui, center, size| views::logo(ui, center, size, logo));
+        #[cfg(debug_assertions)]
+        if self.demo && std::env::var_os("SPOTILITE_DEMO_ICONS").is_some() {
+            return views::icon_sheet(self, ui);
+        }
         match self.app_status.state {
             AppState::Unknown => views::splash(self, ui),
             _ if self.needs_setup() => views::setup_screen(self, ui),

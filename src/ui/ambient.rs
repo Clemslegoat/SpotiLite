@@ -13,19 +13,8 @@ const HEIGHT: usize = 8;
 /// The cover reduced to 6 × 2 average colors (row by row).
 pub type Tint = [Color32; TINT_COLUMNS * TINT_ROWS];
 
-/// Key of the liked tracks banner, which has no picture: a fixed deep violet.
+/// Key of the liked tracks picture (embedded, not downloaded).
 pub const LIKED: &str = "builtin:liked";
-
-pub fn liked_tint() -> Tint {
-    let mut tint = [Color32::BLACK; TINT_COLUMNS * TINT_ROWS];
-    for (i, color) in tint.iter_mut().enumerate() {
-        let t = (i % TINT_COLUMNS) as f32 / (TINT_COLUMNS - 1) as f32;
-        let lift = if i < TINT_COLUMNS { 1.0 } else { 0.85 };
-        let channel = |from: f32, to: f32| ((from + (to - from) * t) * lift) as u8;
-        *color = Color32::from_rgb(channel(118.0, 40.0), channel(84.0, 52.0), channel(235.0, 150.0));
-    }
-    tint
-}
 
 pub fn tint_of(image: &ColorImage) -> Tint {
     let [w, h] = image.size;

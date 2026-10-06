@@ -1,7 +1,5 @@
-//! Hand-drawn widgets: vector icons (no icon font or image assets), round
+//! Hand-drawn widgets: vector icons (no icon font or image file), round
 //! buttons, seek bars, pills and truncated text.
-
-use std::f32::consts::PI;
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
@@ -31,180 +29,273 @@ pub enum Icon {
     Artist,
 }
 
+/// Draws an icon in `rect`. Icons are designed on a 24 × 24 grid, like icon
+/// fonts: round caps and joins, finely sampled curves, filled shapes with
+/// rounded corners. Large icons (30 px and more) get extra details.
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
-    let c = rect.center();
-    let r = rect.width().min(rect.height()) * 0.5;
-    let stroke = Stroke::new((r * 0.15).clamp(1.4, 2.8), color);
+    let pen = Pen::new(painter, rect, color);
+    let detailed = pen.unit >= 1.25;
     match icon {
-        Icon::Play => {
-            let pts = [
-                pos2(c.x - r * 0.32, c.y - r * 0.52),
-                pos2(c.x + r * 0.55, c.y),
-                pos2(c.x - r * 0.32, c.y + r * 0.52),
-            ];
-            painter.add(Shape::convex_polygon(rounded(&pts, r * 0.12), color, Stroke::NONE));
-        }
+        Icon::Play => pen.fill_rounded(&[(8.0, 5.0), (19.4, 12.0), (8.0, 19.0)], 1.9),
         Icon::Pause => {
-            let w = r * 0.26;
-            let h = r * 0.95;
-            for dx in [-r * 0.28, r * 0.28] {
-                let bar = Rect::from_center_size(pos2(c.x + dx, c.y), vec2(w, h));
-                painter.rect_filled(bar, CornerRadius::same((w * 0.3) as u8), color);
-            }
+            pen.fill_rect((6.6, 5.0), (10.4, 19.0), 1.4);
+            pen.fill_rect((13.6, 5.0), (17.4, 19.0), 1.4);
         }
         Icon::Next | Icon::Prev => {
-            let dir = if icon == Icon::Next { 1.0 } else { -1.0 };
-            let pts = [
-                pos2(c.x - dir * r * 0.42, c.y - r * 0.45),
-                pos2(c.x + dir * r * 0.28, c.y),
-                pos2(c.x - dir * r * 0.42, c.y + r * 0.45),
-            ];
-            painter.add(Shape::convex_polygon(rounded(&pts, r * 0.1), color, Stroke::NONE));
-            let bar = Rect::from_center_size(pos2(c.x + dir * r * 0.42, c.y), vec2(r * 0.17, r * 0.9));
-            painter.rect_filled(bar, CornerRadius::same((r * 0.085) as u8), color);
+            // Drawn for "next", mirrored for "previous".
+            let m = |x: f32| if icon == Icon::Next { x } else { 24.0 - x };
+            pen.fill_rounded(&[(m(5.4), 5.6), (m(15.6), 12.0), (m(5.4), 18.4)], 1.7);
+            let (a, b) = (m(16.6), m(19.0));
+            pen.fill_rect((a.min(b), 5.6), (a.max(b), 18.4), 1.2);
         }
         Icon::Heart { filled } => {
+            let outline = pen.heart();
             if filled {
-                // Union of two circles and a triangle: a clean filled heart made of
-                // convex shapes only.
-                let lobe = r * 0.3;
-                let top = c.y - r * 0.12;
-                painter.circle_filled(pos2(c.x - lobe * 0.95, top), lobe, color);
-                painter.circle_filled(pos2(c.x + lobe * 0.95, top), lobe, color);
-                let tri = vec![
-                    pos2(c.x - lobe * 1.9, top + lobe * 0.25),
-                    pos2(c.x + lobe * 1.9, top + lobe * 0.25),
-                    pos2(c.x, c.y + r * 0.58),
-                ];
-                painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+                pen.fill_star(pen.at(12.0, 12.5), outline);
             } else {
-                painter.add(Shape::closed_line(heart_points(c, r * 0.62), stroke));
+                pen.closed(outline);
             }
         }
         Icon::Volume { level } => {
-            let body = vec![
-                pos2(c.x - r * 0.6, c.y - r * 0.2),
-                pos2(c.x - r * 0.35, c.y - r * 0.2),
-                pos2(c.x - r * 0.02, c.y - r * 0.5),
-                pos2(c.x - r * 0.02, c.y + r * 0.5),
-                pos2(c.x - r * 0.35, c.y + r * 0.2),
-                pos2(c.x - r * 0.6, c.y + r * 0.2),
-            ];
-            painter.add(Shape::convex_polygon(body, color, Stroke::NONE));
+            // Rounded body and cone, then the sound waves (or a cross when muted).
+            pen.fill_rect((3.2, 9.0), (8.2, 15.0), 1.3);
+            pen.fill_rounded(&[(7.0, 9.0), (12.2, 4.6), (12.2, 19.4), (7.0, 15.0)], 1.1);
             if level == 0 {
-                let x = c.x + r * 0.4;
-                let d = r * 0.2;
-                painter.line_segment([pos2(x - d, c.y - d), pos2(x + d, c.y + d)], stroke);
-                painter.line_segment([pos2(x - d, c.y + d), pos2(x + d, c.y - d)], stroke);
+                pen.path(&[(15.6, 9.6), (20.4, 14.4)]);
+                pen.path(&[(15.6, 14.4), (20.4, 9.6)]);
             } else {
-                for i in 0..level.min(2) {
-                    let radius = r * (0.35 + 0.28 * f32::from(i));
-                    painter.add(arc(pos2(c.x - r * 0.05, c.y), radius, -PI / 4.0, PI / 4.0, stroke));
+                pen.path_points(pen.arc(13.0, 12.0, 3.6, -48.0, 48.0));
+                if level >= 2 {
+                    pen.path_points(pen.arc(13.0, 12.0, 7.4, -52.0, 52.0));
                 }
             }
         }
-        Icon::Back => {
-            painter.line_segment([pos2(c.x + r * 0.15, c.y - r * 0.42), pos2(c.x - r * 0.27, c.y)], stroke);
-            painter.line_segment([pos2(c.x - r * 0.27, c.y), pos2(c.x + r * 0.15, c.y + r * 0.42)], stroke);
-        }
+        Icon::Back => pen.path(&[(14.8, 5.6), (8.4, 12.0), (14.8, 18.4)]),
         Icon::Queue => {
-            for (i, w) in [0.9, 0.9, 0.55].iter().enumerate() {
-                let y = c.y - r * 0.4 + i as f32 * r * 0.4;
-                painter.line_segment([pos2(c.x - r * 0.55, y), pos2(c.x - r * 0.55 + r * w, y)], stroke);
-            }
-            let tri = vec![
-                pos2(c.x + r * 0.2, c.y + r * 0.2),
-                pos2(c.x + r * 0.6, c.y + r * 0.42),
-                pos2(c.x + r * 0.2, c.y + r * 0.64),
-            ];
-            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+            pen.path(&[(3.8, 6.0), (20.2, 6.0)]);
+            pen.path(&[(3.8, 11.0), (20.2, 11.0)]);
+            pen.path(&[(3.8, 16.0), (11.0, 16.0)]);
+            pen.fill_rounded(&[(14.4, 12.8), (20.8, 16.4), (14.4, 20.0)], 1.0);
         }
         Icon::Refresh => {
-            // Circular arrow: an arc with a gap on the right, arrowhead at its end.
-            let radius = r * 0.62;
-            let (from, to) = (PI * 0.3, PI * 1.9);
-            painter.add(arc(c, radius, from, to, stroke));
-            arrow_head(
-                painter,
-                c + vec2(to.cos(), to.sin()) * radius,
-                vec2(-to.sin(), to.cos()),
-                r * 0.3,
-                color,
-            );
+            // A circle that turns, ending in a solid arrowhead.
+            let (from, to) = (-62.0_f32, 236.0_f32);
+            pen.path_points(pen.arc(12.0, 12.0, 7.4, from, to));
+            let a = to.to_radians();
+            let end = vec2(12.0 + 7.4 * a.cos(), 12.0 + 7.4 * a.sin());
+            let dir = vec2(-a.sin(), a.cos());
+            let normal = vec2(-dir.y, dir.x);
+            let tip = end + dir * 2.6;
+            let base = end - dir * 1.4;
+            let (l, r) = (base + normal * 3.0, base - normal * 3.0);
+            pen.fill_rounded(&[(tip.x, tip.y), (l.x, l.y), (r.x, r.y)], 0.7);
         }
         Icon::Shuffle => {
-            // Two crossing paths with arrowheads on the right.
-            let (l, rr) = (c.x - r * 0.62, c.x + r * 0.5);
-            let (top, bottom) = (c.y - r * 0.38, c.y + r * 0.38);
-            let mid = c.x - r * 0.1;
-            painter.add(Shape::line(
-                vec![pos2(l, top), pos2(mid - r * 0.1, top), pos2(mid + r * 0.25, bottom), pos2(rr, bottom)],
-                stroke,
-            ));
-            painter.add(Shape::line(
-                vec![pos2(l, bottom), pos2(mid - r * 0.1, bottom), pos2(mid + r * 0.25, top), pos2(rr, top)],
-                stroke,
-            ));
-            arrow_head(painter, pos2(rr + r * 0.08, top), vec2(1.0, 0.0), r * 0.26, color);
-            arrow_head(painter, pos2(rr + r * 0.08, bottom), vec2(1.0, 0.0), r * 0.26, color);
+            // Two crossing paths, each ending in an arrow.
+            let curve = |y0: f32, y1: f32| {
+                let mut points = vec![pen.at(3.2, y0), pen.at(6.2, y0)];
+                points.extend(pen.cubic((6.2, y0), (11.2, y0), (11.8, y1), (16.6, y1)));
+                points.push(pen.at(19.6, y1));
+                points
+            };
+            pen.path_points(curve(7.4, 16.6));
+            pen.path_points(curve(16.6, 7.4));
+            pen.path(&[(16.8, 4.6), (19.8, 7.4), (16.8, 10.2)]);
+            pen.path(&[(16.8, 13.8), (19.8, 16.6), (16.8, 19.4)]);
         }
         Icon::Repeat { one } => {
-            // A rounded loop in two halves, each ending with an arrowhead: top
-            // half going right, bottom half (the same, turned around) going left.
-            let (hw, hh, corner) = (r * 0.66, r * 0.42, r * 0.3);
-            let head = r * 0.24;
-            let half: Vec<Pos2> = [pos2(c.x - hw, c.y + hh * 0.35)]
-                .into_iter()
-                .chain((0..=8).map(|i| {
-                    let a = PI + PI * 0.5 * i as f32 / 8.0;
-                    pos2(c.x - hw + corner, c.y - hh + corner) + vec2(a.cos(), a.sin()) * corner
-                }))
-                .chain([pos2(c.x + hw * 0.45, c.y - hh)])
-                .collect();
-            for flip in [1.0, -1.0] {
-                let turn = |q: Pos2| c + (q - c) * flip;
-                painter.add(Shape::line(half.iter().copied().map(turn).collect(), stroke));
-                let tip = turn(pos2(c.x + hw * 0.45 + head * 0.9, c.y - hh));
-                arrow_head(painter, tip, vec2(flip, 0.0), head, color);
-            }
+            // A rounded loop in two halves, each ending in an arrow.
+            let mut top = vec![pen.at(4.0, 13.2)];
+            top.extend(pen.arc(7.6, 10.6, 3.6, 180.0, 270.0));
+            top.push(pen.at(18.6, 7.0));
+            pen.path_points(top);
+            pen.path(&[(16.0, 4.4), (18.8, 7.0), (16.0, 9.6)]);
+            let mut bottom = vec![pen.at(20.0, 10.8)];
+            bottom.extend(pen.arc(16.4, 13.4, 3.6, 0.0, 90.0));
+            bottom.push(pen.at(5.4, 17.0));
+            pen.path_points(bottom);
+            pen.path(&[(8.0, 14.4), (5.2, 17.0), (8.0, 19.6)]);
             if one {
-                painter.text(c, Align2::CENTER_CENTER, "1", FontId::proportional(r * 0.62), color);
+                let size = (6.4 * pen.unit).round().max(6.0);
+                painter.text(pen.at(12.0, 11.8), Align2::CENTER_CENTER, "1", theme::strong_font(size), color);
             }
         }
         Icon::Search => {
-            let lens = c + vec2(-r * 0.12, -r * 0.12);
-            painter.circle_stroke(lens, r * 0.42, stroke);
-            let from = lens + vec2(r * 0.3, r * 0.3);
-            painter.line_segment([from, from + vec2(r * 0.32, r * 0.32)], stroke);
+            pen.closed(pen.arc(10.4, 10.4, 6.4, 0.0, 360.0));
+            pen.with_width(pen.width * 1.25).path(&[(15.3, 15.3), (20.2, 20.2)]);
+            if detailed {
+                // A glint on the lens.
+                pen.with_width(pen.width * 0.6).path_points(pen.arc(10.4, 10.4, 3.7, 200.0, 255.0));
+            }
         }
         Icon::Disc => {
-            painter.circle_stroke(c, r * 0.6, stroke);
-            painter.circle_filled(c, r * 0.14, color);
+            // A record: rim, grooves catching the light, label and spindle hole.
+            pen.closed(pen.arc(12.0, 12.0, 9.0, 0.0, 360.0));
+            let fine = pen.with_width(pen.width * 0.55);
+            fine.path_points(pen.arc(12.0, 12.0, 6.3, 200.0, 250.0));
+            fine.path_points(pen.arc(12.0, 12.0, 6.3, 20.0, 70.0));
+            if detailed {
+                fine.path_points(pen.arc(12.0, 12.0, 7.7, 205.0, 235.0));
+                fine.path_points(pen.arc(12.0, 12.0, 7.7, 25.0, 55.0));
+            }
+            pen.closed(pen.arc(12.0, 12.0, 3.0, 0.0, 360.0));
+            pen.disc(12.0, 12.0, 0.9);
         }
         Icon::Library => {
-            // Three books: two upright, one leaning.
-            for dx in [-0.45, -0.12] {
-                let x = c.x + r * dx;
-                painter.line_segment([pos2(x, c.y - r * 0.55), pos2(x, c.y + r * 0.55)], stroke);
-            }
-            painter.line_segment(
-                [pos2(c.x + r * 0.2, c.y - r * 0.5), pos2(c.x + r * 0.5, c.y + r * 0.55)],
-                stroke,
-            );
+            // Two beamed notes.
+            pen.path(&[(8.8, 7.0), (8.8, 17.2)]);
+            pen.path(&[(18.2, 5.2), (18.2, 15.4)]);
+            pen.fill_rounded(&[(8.0, 5.4), (19.0, 3.2), (19.0, 6.6), (8.0, 8.8)], 0.6);
+            pen.disc(6.4, 17.4, 2.8);
+            pen.disc(15.8, 15.6, 2.8);
         }
         Icon::Artist => {
-            // Head and shoulders.
-            painter.circle_stroke(pos2(c.x, c.y - r * 0.28), r * 0.3, stroke);
-            painter.add(arc(pos2(c.x, c.y + r * 0.78), r * 0.62, PI * 1.12, PI * 1.88, stroke));
+            pen.closed(pen.arc(12.0, 7.9, 3.9, 0.0, 360.0));
+            pen.path_points(pen.arc(12.0, 22.0, 8.2, 207.0, 333.0));
         }
         Icon::Settings => {
-            // Two sliders.
-            for (dy, knob) in [(-0.3, 0.25), (0.3, -0.25)] {
-                let y = c.y + r * dy;
-                painter.line_segment([pos2(c.x - r * 0.6, y), pos2(c.x + r * 0.6, y)], stroke);
-                painter.circle_filled(pos2(c.x + r * knob, y), r * 0.17, color);
+            // A gear: eight teeth around a hub.
+            let (outer, inner) = (9.6, 7.2);
+            let mut outline = Vec::new();
+            for k in 0..8 {
+                let a = k as f32 * 45.0;
+                for (angle, radius) in
+                    [(a - 13.0, inner), (a - 8.0, outer), (a + 8.0, outer), (a + 13.0, inner)]
+                {
+                    let t = angle.to_radians();
+                    outline.push(pen.at(12.0 + radius * t.cos(), 12.0 + radius * t.sin()));
+                }
+                outline.extend(pen.arc(12.0, 12.0, inner, a + 16.0, a + 29.0));
             }
+            pen.closed(outline);
+            pen.closed(pen.arc(12.0, 12.0, 3.2, 0.0, 360.0));
         }
+    }
+}
+
+/// Draws on the 24 × 24 icon grid.
+#[derive(Clone, Copy)]
+struct Pen<'a> {
+    painter: &'a egui::Painter,
+    origin: Pos2,
+    /// Pixels per grid unit.
+    unit: f32,
+    color: Color32,
+    width: f32,
+}
+
+impl<'a> Pen<'a> {
+    fn new(painter: &'a egui::Painter, rect: Rect, color: Color32) -> Self {
+        let unit = rect.width().min(rect.height()) / 24.0;
+        let origin = rect.center() - vec2(12.0, 12.0) * unit;
+        Pen { painter, origin, unit, color, width: (1.9 * unit).clamp(1.3, 3.2) }
+    }
+
+    fn with_width(self, width: f32) -> Self {
+        Pen { width: width.max(1.0), ..self }
+    }
+
+    fn at(&self, x: f32, y: f32) -> Pos2 {
+        self.origin + vec2(x, y) * self.unit
+    }
+
+    /// Points of a circular arc (degrees, clockwise on screen).
+    fn arc(&self, cx: f32, cy: f32, radius: f32, from: f32, to: f32) -> Vec<Pos2> {
+        let steps = (((to - from).abs() / 6.0).ceil() as usize).max(6);
+        (0..=steps)
+            .map(|i| {
+                let a = (from + (to - from) * i as f32 / steps as f32).to_radians();
+                self.at(cx + radius * a.cos(), cy + radius * a.sin())
+            })
+            .collect()
+    }
+
+    /// Points of a cubic Bézier curve (the first point excluded).
+    fn cubic(&self, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> Vec<Pos2> {
+        (1..=16)
+            .map(|i| {
+                let t = i as f32 / 16.0;
+                let u = 1.0 - t;
+                let f = |a: f32, b: f32, c: f32, d: f32| {
+                    u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+                };
+                self.at(f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1))
+            })
+            .collect()
+    }
+
+    /// Rounded heart (two lobes, sides tangent to a rounded tip), clockwise.
+    fn heart(&self) -> Vec<Pos2> {
+        let (left, right, lobe): ((f32, f32), (f32, f32), f32) = ((8.1, 9.2), (15.9, 9.2), 4.75);
+        let (tip, tip_radius): ((f32, f32), f32) = ((12.0, 18.6), 1.7);
+        // Outer tangent between the left lobe and the tip circle.
+        let (dx, dy) = (tip.0 - left.0, tip.1 - left.1);
+        let side = dy.atan2(dx) + ((lobe - tip_radius) / dx.hypot(dy)).acos();
+        let side = side.to_degrees();
+        // Where the two lobes meet at the top.
+        let notch = ((12.0 - left.0) / lobe).acos().to_degrees();
+        let mut points = self.arc(right.0, right.1, lobe, 180.0 + notch, 360.0 + 180.0 - side);
+        points.extend(self.arc(tip.0, tip.1, tip_radius, 180.0 - side, side));
+        points.extend(self.arc(left.0, left.1, lobe, side, 360.0 - notch));
+        points
+    }
+
+    /// Open line with round caps and joins.
+    fn path(&self, points: &[(f32, f32)]) {
+        self.path_points(points.iter().map(|&(x, y)| self.at(x, y)).collect());
+    }
+
+    fn path_points(&self, points: Vec<Pos2>) {
+        let radius = self.width * 0.5;
+        // Joins of short polylines (curves are sampled finely enough not to need them).
+        let joins = if points.len() <= 4 { points.len() } else { 0 };
+        for p in points.iter().take(joins) {
+            self.painter.circle_filled(*p, radius, self.color);
+        }
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            self.painter.circle_filled(*first, radius, self.color);
+            self.painter.circle_filled(*last, radius, self.color);
+        }
+        self.painter.add(Shape::line(points, Stroke::new(self.width, self.color)));
+    }
+
+    fn closed(&self, points: Vec<Pos2>) {
+        self.painter.add(Shape::closed_line(points, Stroke::new(self.width, self.color)));
+    }
+
+    fn disc(&self, x: f32, y: f32, radius: f32) {
+        self.painter.circle_filled(self.at(x, y), radius * self.unit, self.color);
+    }
+
+    /// Convex polygon with rounded corners (radius in grid units).
+    fn fill_rounded(&self, points: &[(f32, f32)], radius: f32) {
+        let points: Vec<Pos2> = points.iter().map(|&(x, y)| self.at(x, y)).collect();
+        self.painter.add(Shape::convex_polygon(
+            rounded(&points, radius * self.unit),
+            self.color,
+            Stroke::NONE,
+        ));
+    }
+
+    fn fill_rect(&self, min: (f32, f32), max: (f32, f32), radius: f32) {
+        let rect = Rect::from_min_max(self.at(min.0, min.1), self.at(max.0, max.1));
+        self.painter.rect_filled(rect, CornerRadius::same((radius * self.unit).round() as u8), self.color);
+    }
+
+    /// Fills a shape that is not convex but whose whole outline is visible from
+    /// `kernel` (a fan of triangles), with an anti-aliased edge.
+    fn fill_star(&self, kernel: Pos2, outline: Vec<Pos2>) {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(kernel, self.color);
+        for p in &outline {
+            mesh.colored_vertex(*p, self.color);
+        }
+        let n = outline.len() as u32;
+        for i in 0..n {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+        }
+        self.painter.add(Shape::mesh(mesh));
+        self.painter.add(Shape::closed_line(outline, Stroke::new(1.0, self.color)));
     }
 }
 
@@ -226,36 +317,6 @@ fn rounded(points: &[Pos2], radius: f32) -> Vec<Pos2> {
         }
     }
     out
-}
-
-fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, size: f32, color: Color32) {
-    let d = direction.normalized();
-    let n = vec2(-d.y, d.x);
-    let base = tip - d * size;
-    let tri = vec![tip, base + n * size * 0.75, base - n * size * 0.75];
-    painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
-}
-
-fn arc(center: Pos2, radius: f32, from: f32, to: f32, stroke: Stroke) -> Shape {
-    let n = 16;
-    let points = (0..=n)
-        .map(|i| {
-            let a = from + (to - from) * i as f32 / n as f32;
-            center + vec2(a.cos(), a.sin()) * radius
-        })
-        .collect();
-    Shape::line(points, stroke)
-}
-
-fn heart_points(c: Pos2, size: f32) -> Vec<Pos2> {
-    (0..40)
-        .map(|i| {
-            let t = i as f32 / 40.0 * 2.0 * PI;
-            let x = 16.0 * t.sin().powi(3);
-            let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
-            pos2(c.x + x / 17.0 * size, c.y - y / 17.0 * size + size * 0.1)
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]

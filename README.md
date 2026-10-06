@@ -1,3 +1,5 @@
+<img src="assets/spotilite-256.png" alt="Logo de SpotiLite" width="96">
+
 # SpotiLite
 
 **Écoutez Spotify sur Windows avec une application légère, sobre et rapide.**
