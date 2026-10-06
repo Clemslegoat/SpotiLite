@@ -536,6 +536,13 @@ impl WebApi {
         self.request(Method::PUT, &url).await.map(drop)
     }
 
+    /// Pauses or resumes the engine through Spotify's servers (the way the
+    /// Spotify apps control it), when the engine did not follow a local command.
+    pub async fn set_playing(&self, device_id: &str, playing: bool) -> ApiResult<()> {
+        let url = player_url(if playing { "play" } else { "pause" }, device_id, &[])?;
+        self.request(Method::PUT, &url).await.map(drop)
+    }
+
     /// Adds a track to Spotify's own queue (while it plays a playlist or an artist).
     pub async fn add_to_queue(&self, device_id: &str, track_id: &str) -> ApiResult<()> {
         let uri = format!("spotify:track:{track_id}");
@@ -823,6 +830,8 @@ mod tests {
             url,
             "https://api.spotify.com/v1/me/player/queue?device_id=dev+1&uri=spotify%3Atrack%3Aabc"
         );
+        let pause = player_url("pause", "d", &[]).unwrap();
+        assert_eq!(pause, "https://api.spotify.com/v1/me/player/pause?device_id=d");
     }
 
     #[tokio::test]

@@ -910,18 +910,11 @@ impl App {
     fn handle_media_keys(&mut self, ctx: &egui::Context) {
         use crate::media::MediaAction;
         for action in self.media.poll() {
+            log::info!("media key: {action:?}");
             match action {
                 MediaAction::Toggle => self.send(Command::PlayPause),
-                MediaAction::Play => {
-                    if !self.player.playing {
-                        self.send(Command::PlayPause);
-                    }
-                }
-                MediaAction::Pause => {
-                    if self.player.playing {
-                        self.send(Command::PlayPause);
-                    }
-                }
+                MediaAction::Play => self.send(Command::Resume),
+                MediaAction::Pause => self.send(Command::Pause),
                 MediaAction::Next => self.send(Command::Next),
                 MediaAction::Previous => self.send(Command::Previous),
                 MediaAction::Seek(ms) => self.send(Command::Seek(ms)),

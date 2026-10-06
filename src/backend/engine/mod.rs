@@ -164,6 +164,9 @@ pub enum EngineEvent {
     /// DRM systems available in this WebView2.
     Drm(Vec<String>),
     Log(String),
+    /// A media key or media panel action that reached the page ("play",
+    /// "pause", "nexttrack"…): handled by SpotiLite like its own buttons.
+    Media(String),
     /// Bytes received by the WebView2 (data usage).
     Bytes(u64),
     /// Memory used by the WebView2 processes (private working set).
@@ -215,6 +218,10 @@ enum Message {
         #[serde(default)]
         message: String,
     },
+    Media {
+        #[serde(default)]
+        action: String,
+    },
 }
 
 /// Decodes a message posted by the page.
@@ -241,6 +248,7 @@ pub fn parse_message(json: &str) -> Option<EngineEvent> {
         Message::Error { kind, message } => EngineEvent::Error(ErrorKind::parse(&kind), message),
         Message::Drm { systems } => EngineEvent::Drm(systems),
         Message::Log { message } => EngineEvent::Log(message),
+        Message::Media { action } => EngineEvent::Media(action),
     })
 }
 
@@ -496,6 +504,10 @@ mod tests {
         );
         assert_eq!(parse_message(r#"{"type":"not_ready","device_id":"abc"}"#), Some(EngineEvent::NotReady));
         assert_eq!(parse_message(r#"{"type":"need_token"}"#), Some(EngineEvent::NeedToken));
+        assert_eq!(
+            parse_message(r#"{"type":"media","action":"pause"}"#),
+            Some(EngineEvent::Media("pause".into()))
+        );
         assert_eq!(parse_message(r#"{"type":"state","active":false}"#), Some(EngineEvent::State(None)));
         assert_eq!(
             parse_message(

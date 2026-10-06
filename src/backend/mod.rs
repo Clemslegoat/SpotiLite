@@ -60,6 +60,10 @@ pub enum Command {
         total: u32,
     },
     PlayPause,
+    /// Explicit pause and play (media keys, Windows media panel): never a toggle,
+    /// so that they act right even if the shown state is out of date.
+    Pause,
+    Resume,
     Next,
     Previous,
     Seek(u32),
@@ -259,6 +263,8 @@ enum Internal {
     Engine(u64, EngineEvent),
     /// Starting playback failed (load generation, error).
     PlayFailed(u64, ApiError),
+    /// Checks that the engine followed pause (false) or play (true) command `.0`.
+    CheckFollowed(u64, bool),
     /// Playback scopes missing from the authorization (`.1`: the browser may be opened).
     Scopes(Vec<&'static str>, bool),
     TokenFailed(String),
@@ -379,6 +385,10 @@ struct Core {
     compatible: bool,
     /// Load generation for which a stalled start was already handled.
     stalled: u64,
+    /// Paused state last reported by the engine (None before any report).
+    engine_paused: Option<bool>,
+    /// Number of the last pause or play command (for `CheckFollowed`).
+    control: u64,
     last_active: Instant,
     /// The authorization lacks the playback scopes.
     needs_playback_auth: bool,
@@ -438,6 +448,8 @@ impl Core {
             device_prepared: false,
             compatible,
             stalled: 0,
+            engine_paused: None,
+            control: 0,
             last_active: Instant::now(),
             needs_playback_auth: false,
             playback_auth_asked: false,
@@ -701,6 +713,16 @@ impl Core {
                 self.play_remote(uri, title, offset, 0);
             }
             Command::PlayPause => self.play_pause(),
+            Command::Pause => {
+                if self.playing || self.engine_paused == Some(false) {
+                    self.pause();
+                }
+            }
+            Command::Resume => {
+                if !self.playing {
+                    self.play_pause();
+                }
+            }
             Command::Next => self.skip(false),
             Command::Previous => self.previous(),
             Command::Seek(ms) => self.seek_to(ms),
@@ -781,6 +803,7 @@ impl Core {
                 }
                 self.send_app_status();
             }
+            Internal::CheckFollowed(control, playing) => self.ensure_followed(control, playing),
             Internal::SkipAfterFailure(generation) => {
                 if generation == self.load_generation {
                     self.skip(false);
@@ -1015,21 +1038,13 @@ impl Core {
 
     fn play_pause(&mut self) {
         if self.playing {
-            if let Some(engine) = &self.engine {
-                engine.send(EngineCommand::Pause);
-            }
-            let position = self.current_position();
-            self.flush_listened();
-            self.playing = false;
-            self.position_ms = position;
-            self.position_at = Instant::now();
-            self.tracker.paused(Instant::now());
-            return self.send_playback(false);
+            return self.pause();
         }
         if self.loaded && self.started() && self.device_id.is_some() {
             if let Some(engine) = &self.engine {
                 engine.send(EngineCommand::Resume);
             }
+            self.check_followed(true);
             return;
         }
         // Nothing loaded (engine asleep, other device…): start again where we were.
@@ -1042,6 +1057,46 @@ impl Core {
         } else if let Some(track) = self.queue.current().cloned() {
             self.load(track, true, position);
         }
+    }
+
+    fn pause(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::Pause);
+            self.check_followed(false);
+        }
+        let position = self.current_position();
+        self.flush_listened();
+        self.playing = false;
+        self.position_ms = position;
+        self.position_at = Instant::now();
+        self.tracker.paused(Instant::now());
+        self.send_playback(false);
+    }
+
+    /// In a moment, checks that the engine paused (or played) as asked.
+    fn check_followed(&mut self, playing: bool) {
+        self.control += 1;
+        let (control, internal) = (self.control, self.internal.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let _ = internal.send(Internal::CheckFollowed(control, playing));
+        });
+    }
+
+    /// The engine did not follow a pause or play command (its own state can get
+    /// out of step after a pause made elsewhere): Spotify's servers are asked to
+    /// do it, as when the Spotify app controls SpotiLite.
+    fn ensure_followed(&mut self, control: u64, playing: bool) {
+        if control != self.control || self.engine_paused != Some(playing) {
+            return;
+        }
+        let (Some(api), Some(device)) = (self.api(), self.device_id.clone()) else { return };
+        log::warn!("engine did not {}: asking Spotify", if playing { "resume" } else { "pause" });
+        tokio::spawn(async move {
+            if let Err(e) = api.set_playing(&device, playing).await {
+                log::warn!("remote {}: {e}", if playing { "resume" } else { "pause" });
+            }
+        });
     }
 
     fn skip(&mut self, auto: bool) {
@@ -1182,6 +1237,7 @@ impl Core {
         }
         self.device_id = None;
         self.pending = None;
+        self.engine_paused = None;
         self.tracker.clear();
         if let Some(remote) = &mut self.remote {
             remote.started = false;
@@ -1233,6 +1289,14 @@ impl Core {
                 });
             }
             EngineEvent::State(Some(state)) => {
+                if self.engine_paused != Some(state.paused) {
+                    log::info!(
+                        "engine {} at {} ms",
+                        if state.paused { "paused" } else { "playing" },
+                        state.position_ms
+                    );
+                    self.engine_paused = Some(state.paused);
+                }
                 if self.remote.is_some() {
                     self.on_remote_state(state);
                 } else {
@@ -1253,6 +1317,7 @@ impl Core {
                 }
             }
             EngineEvent::State(None) => {
+                self.engine_paused = None;
                 // Playback moved to another device (phone, other computer…).
                 if self.loaded && self.started() {
                     let position = self.current_position();
@@ -1288,6 +1353,16 @@ impl Core {
                 self.send_engine_status();
             }
             EngineEvent::Log(message) => log::info!("engine: {message}"),
+            EngineEvent::Media(action) => {
+                log::info!("media action in the engine page: {action}");
+                match action.as_str() {
+                    "play" if !self.playing => self.play_pause(),
+                    "pause" | "stop" if self.playing || self.engine_paused == Some(false) => self.pause(),
+                    "nexttrack" => self.skip(false),
+                    "previoustrack" => self.previous(),
+                    _ => {}
+                }
+            }
             EngineEvent::Bytes(bytes) => self.engine_bytes += bytes,
             EngineEvent::Memory(bytes) => self.ui.send(Event::EngineMemory(bytes)),
             EngineEvent::Failed(message) => {

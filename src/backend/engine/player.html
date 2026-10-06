@@ -23,6 +23,20 @@ const waiting = [];
 
 window.addEventListener("error", (e) => send({ type: "log", message: "js: " + String(e.message || e) }));
 
+// Media keys or Windows' media panel reaching this page (if WebView2 receives
+// them) go through SpotiLite instead of acting on the audio behind the player's
+// back: one state, one behavior. The player cannot replace these handlers.
+if (navigator.mediaSession) {
+  const actions = ["play", "pause", "stop", "nexttrack", "previoustrack"];
+  for (const action of actions) {
+    try { navigator.mediaSession.setActionHandler(action, () => send({ type: "media", action })); } catch (e) { /* unsupported */ }
+  }
+  const set = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
+  navigator.mediaSession.setActionHandler = (action, handler) => {
+    if (!actions.includes(action)) set(action, handler);
+  };
+}
+
 if (host) {
   host.addEventListener("message", (event) => {
     const m = event.data || {};
