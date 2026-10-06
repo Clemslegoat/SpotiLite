@@ -200,8 +200,27 @@ impl Queue {
         out
     }
 
-    pub fn clear_manual(&mut self) {
-        self.manual.clear();
+    /// Removes the track at `index` of [`Queue::upcoming`] if it is still `id`.
+    pub fn remove_upcoming(&mut self, index: usize, id: &str) -> bool {
+        if index < self.manual.len() {
+            if self.manual[index].id != id {
+                return false;
+            }
+            self.manual.remove(index);
+            return true;
+        }
+        let wanted = index - self.manual.len();
+        let found = (self.pos + 1..self.order.len())
+            .filter(|&p| self.reachable(&self.context[self.order[p]]))
+            .nth(wanted)
+            .filter(|&p| self.context[self.order[p]].id == id);
+        match found {
+            Some(p) => {
+                self.order.remove(p);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -306,5 +325,20 @@ mod tests {
         assert_eq!(q.current().map(|t| t.id.as_str()), Some("t4"));
         q.set_shuffle(false);
         assert_eq!(id(q.advance(true)), "t5");
+    }
+
+    #[test]
+    fn removes_added_and_upcoming_tracks() {
+        let mut q = Queue::default();
+        q.play_context(tracks(5), 0);
+        q.enqueue(Track { id: "extra".into(), playable: true, ..Default::default() });
+        let ids = |q: &Queue| q.upcoming(10).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&q), ["extra", "t1", "t2", "t3", "t4"]);
+        assert!(!q.remove_upcoming(0, "t1"), "the list changed meanwhile");
+        assert!(q.remove_upcoming(0, "extra"));
+        assert!(q.remove_upcoming(1, "t2"));
+        assert_eq!(ids(&q), ["t1", "t3", "t4"]);
+        assert_eq!(q.advance(false).map(|t| t.id).as_deref(), Some("t1"));
+        assert_eq!(q.advance(false).map(|t| t.id).as_deref(), Some("t3"));
     }
 }

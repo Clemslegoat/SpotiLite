@@ -889,22 +889,10 @@ fn queue_page(app: &mut App, ui: &mut Ui) {
         track_rows_plain(app, ui, Arc::new(vec![now]), "queue-now");
         ui.add_space(14.0);
     }
-    ui.horizontal(|ui| {
-        section_title(ui, &p, "À suivre");
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if app.player.context.is_none()
-                && !app.player.upcoming.is_empty()
-                && widgets::pill(ui, &p, "Vider les ajouts", false).clicked()
-            {
-                app.send(Command::ClearQueue);
-            }
-        });
-    });
+    section_title(ui, &p, "À suivre");
     let upcoming = Arc::new(app.player.upcoming.clone());
     if upcoming.is_empty() {
-        ui.label(
-            RichText::new("Rien à suivre. Clic droit sur un titre → « Ajouter à la file ».").color(p.dim),
-        );
+        ui.label(RichText::new("Rien à suivre.").color(p.dim));
     } else {
         track_table(app, ui, upcoming, "queue");
     }
@@ -1107,10 +1095,17 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
             app.play(tracks.clone(), index);
             ui.close();
         }
-        if ui.button("Ajouter à la file").clicked() {
+        // SpotiLite's own queue only: Spotify's (whole playlists) cannot be edited.
+        if salt == "queue" && app.player.context.is_none() {
+            if ui.button("Retirer de la file d'attente").clicked() {
+                app.send(Command::RemoveFromQueue { index, track_id: track.id.clone() });
+                ui.close();
+            }
+        } else if ui.button("Ajouter à la file").clicked() {
             app.send(Command::Enqueue(track.clone()));
             ui.close();
         }
+        add_to_playlist_menu(app, ui, &track);
         ui.separator();
         let liked = app.player.liked.get(&track.id).copied();
         let like_label =
@@ -1134,6 +1129,29 @@ fn track_row(app: &mut App, ui: &mut Ui, tracks: &Arc<Vec<Track>>, index: usize,
             ui.ctx().copy_text(format!("https://open.spotify.com/track/{}", track.id));
             ui.close();
         }
+    });
+}
+
+/// "Ajouter à une playlist" submenu: the user's own and collaborative playlists.
+fn add_to_playlist_menu(app: &mut App, ui: &mut Ui, track: &Track) {
+    let editable: Vec<(String, String)> = app
+        .playlists
+        .iter()
+        .filter(|pl| pl.collaborative || (!app.user_id.is_empty() && pl.owner_id == app.user_id))
+        .map(|pl| (pl.id.clone(), pl.name.clone()))
+        .collect();
+    ui.add_enabled_ui(!editable.is_empty(), |ui| {
+        ui.menu_button("Ajouter à une playlist", |ui| {
+            ui.set_min_width(180.0);
+            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (playlist_id, playlist_name) in editable {
+                    if ui.button(&playlist_name).clicked() {
+                        app.send(Command::AddToPlaylist { playlist_id, playlist_name, track: track.clone() });
+                        ui.close();
+                    }
+                }
+            });
+        });
     });
 }
 
@@ -1537,14 +1555,14 @@ fn settings_page(app: &mut App, ui: &mut Ui) {
             });
         });
 
-        card(ui, &p, "Mémoire et données", |ui| {
-            option_row(ui, &p, "Libérer quand réduite", |ui| {
-                changed |= widgets::toggle(ui, &p, &mut app.settings.trim_when_minimized);
-            });
-            option_row(ui, &p, "Données de la session", |ui| {
+        card(ui, &p, "Données", |ui| {
+            option_row(ui, &p, "Cette session", |ui| {
                 ui.label(RichText::new(human_bytes(app.usage.0 + app.usage.1)).color(p.text));
             });
-            option_row(ui, &p, "Cache", |ui| {
+            option_row(ui, &p, "En cache", |ui| {
+                let size = app.cache_size.map_or_else(|| "…".to_string(), human_bytes);
+                ui.label(RichText::new(size).color(p.text));
+                ui.add_space(12.0);
                 if widgets::pill(ui, &p, "Vider", false).clicked() {
                     app.send(Command::ClearCache);
                 }

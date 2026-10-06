@@ -127,6 +127,12 @@ pub struct PlaylistSummary {
     /// Cover (≈300 px) for the page banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Spotify id of the owner, and whether others may add tracks: tracks can
+    /// be added to the user's own and to collaborative playlists.
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub collaborative: bool,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -23,6 +23,8 @@ pub const WEB_API_SCOPES: &[&str] = &[
     "user-read-private",
     "playlist-read-private",
     "playlist-read-collaborative",
+    "playlist-modify-public",
+    "playlist-modify-private",
     "user-library-read",
     "user-library-modify",
     "streaming",

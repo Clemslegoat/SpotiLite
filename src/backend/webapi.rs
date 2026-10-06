@@ -323,14 +323,23 @@ impl WebApi {
         Ok(out)
     }
 
-    pub async fn me(&self) -> ApiResult<String> {
+    /// The user's Spotify id and display name.
+    pub async fn me(&self) -> ApiResult<(String, String)> {
         #[derive(Deserialize)]
         struct Me {
             id: String,
             display_name: Option<String>,
         }
         let me: Me = self.get(&format!("{API}/me")).await?;
-        Ok(me.display_name.filter(|n| !n.is_empty()).unwrap_or(me.id))
+        let name = me.display_name.filter(|n| !n.is_empty()).unwrap_or_else(|| me.id.clone());
+        Ok((me.id, name))
+    }
+
+    /// Adds a track at the end of one of the user's playlists.
+    pub async fn add_to_playlist(&self, playlist_id: &str, track_id: &str) -> ApiResult<()> {
+        let body = serde_json::json!({ "uris": [format!("spotify:track:{track_id}")] });
+        let url = format!("{API}/playlists/{playlist_id}/items");
+        self.request_with(Method::POST, &url, Some(&body)).await.map(drop)
     }
 
     pub async fn playlists(&self) -> ApiResult<Vec<PlaylistSummary>> {
@@ -767,6 +776,8 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
         snapshot_id: Option<String>,
         #[serde(default)]
         images: Option<Vec<ImageJson>>,
+        #[serde(default)]
+        collaborative: bool,
     }
     let p: PlaylistJson = serde_json::from_value(value).ok()?;
     let total = p
@@ -776,6 +787,7 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
         .and_then(|v| v.get("total"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
+    let owner_id = p.owner.as_ref().map(|o| o.id.clone()).unwrap_or_default();
     Some(PlaylistSummary {
         id: p.id?,
         name: p.name,
@@ -783,6 +795,8 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
         total,
         snapshot_id: p.snapshot_id.unwrap_or_default(),
         image: p.images.as_deref().and_then(medium_image),
+        owner_id,
+        collaborative: p.collaborative,
     })
 }
 
@@ -918,6 +932,7 @@ mod tests {
                           "tracks": {"total": 3}});
         let n = playlist_from(new).unwrap();
         assert_eq!((n.total, n.owner.as_str(), n.snapshot_id.as_str()), (12, "me", "s"));
+        assert_eq!((n.owner_id.as_str(), n.collaborative), ("me", false));
         let o = playlist_from(old).unwrap();
         assert_eq!((o.total, o.owner.as_str()), (3, "Moi"));
     }

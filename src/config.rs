@@ -21,8 +21,6 @@ pub struct Settings {
     pub legacy_client_id: String,
     /// Port of the redirect URI registered in the user's Spotify application.
     pub redirect_port: u16,
-    /// Release unused memory pages when the window is minimized (Windows only).
-    pub trim_when_minimized: bool,
     /// Stop the playback engine (its WebView2 processes) after 5 minutes without
     /// playing; it starts again at the next playback.
     pub engine_sleep: bool,
@@ -39,7 +37,6 @@ impl Default for Settings {
             repeat: Repeat::Off,
             legacy_client_id: String::new(),
             redirect_port: 8898,
-            trim_when_minimized: true,
             engine_sleep: true,
             window_size: [1040.0, 680.0],
         }

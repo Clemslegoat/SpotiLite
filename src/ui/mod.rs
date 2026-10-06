@@ -152,6 +152,8 @@ pub struct App {
     settings: Settings,
     palette: Palette,
     user: String,
+    /// Spotify id of the user (to know which playlists accept new tracks).
+    user_id: String,
     /// The user's own Spotify application (library, search).
     app_status: AppStatus,
     playlists: Vec<PlaylistSummary>,
@@ -183,6 +185,8 @@ pub struct App {
     /// State of the playback engine and memory of its WebView2 processes.
     engine_status: String,
     engine_memory: u64,
+    /// Size of the disk cache, measured when the settings are opened.
+    cache_size: Option<u64>,
     media: MediaKeys,
     minimized: bool,
     /// Setup form.
@@ -223,6 +227,7 @@ impl App {
             paths,
             palette,
             user: String::new(),
+            user_id: String::new(),
             app_status: AppStatus {
                 state: AppState::Unknown,
                 client_id: String::new(),
@@ -254,6 +259,7 @@ impl App {
             memory_at: None,
             engine_status: "Arrêté".into(),
             engine_memory: 0,
+            cache_size: None,
             media,
             minimized: false,
             settings,
@@ -270,6 +276,7 @@ impl App {
         }
         self.demo = true;
         self.user = "Démo".into();
+        self.user_id = "demo".into();
         let names =
             ["Lueurs", "Minuit passé", "Rivages", "Sur le fil", "Horizon bas", "Nocturne", "Papier", "Écho"];
         let artists = ["Nora Vale", "Les Ondes", "Kaito", "Mélodie Brune", "Atlas Sud"];
@@ -303,6 +310,8 @@ impl App {
                     image: Some(
                         ["demo-cover", "demo-artist-0", "demo-artist-1", "demo-artist-2"][i % 4].into(),
                     ),
+                    owner_id: "demo".into(),
+                    collaborative: false,
                 })
                 .collect();
         // A synthetic cover (dusk gradient) to show the player bar colors.
@@ -358,6 +367,8 @@ impl App {
         );
         self.recent = Arc::new(tracks.iter().skip(4).step_by(5).take(12).cloned().collect());
         self.engine_status = "Prêt · DRM Widevine".into();
+        self.cache_size = Some(26_400_000);
+        self.usage = (2_300_000, 38_700_000);
         self.engine_memory = 112 * 1024 * 1024;
         // Artists: three portraits (synthetic gradients), the rest with initials.
         let portrait = |ctx: &egui::Context, covers: &mut Covers, i: usize| {
@@ -454,7 +465,8 @@ impl App {
         }
         self.failures.remove(&view);
         match &view {
-            ViewKey::Home | ViewKey::Settings | ViewKey::Queue => {}
+            ViewKey::Settings => self.send(Command::MeasureCache),
+            ViewKey::Home | ViewKey::Queue => {}
             _ => self.send(Command::Open { view, force }),
         }
     }
@@ -507,7 +519,10 @@ impl App {
             Event::Info(text) => self.toast(text, false),
             Event::Error(text) => self.toast(text, true),
             Event::Notice { key, text, error } => self.toast_keyed(Some(key), text, error),
-            Event::LoggedIn { user } => self.user = user,
+            Event::LoggedIn { user, id } => {
+                self.user = user;
+                self.user_id = id;
+            }
             Event::App(status) => self.on_app_status(status),
             Event::Playlists(list) => {
                 self.playlists = list;
@@ -586,6 +601,7 @@ impl App {
             Event::DataUsage { api_bytes, audio_bytes } => self.usage = (api_bytes, audio_bytes),
             Event::EngineStatus(text) => self.engine_status = text,
             Event::EngineMemory(bytes) => self.engine_memory = bytes,
+            Event::CacheSize(bytes) => self.cache_size = Some(bytes),
         }
     }
 
@@ -883,7 +899,7 @@ impl App {
 
     fn housekeeping(&mut self, ctx: &egui::Context) {
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        if minimized && !self.minimized && self.settings.trim_when_minimized {
+        if minimized && !self.minimized {
             // Give memory back to Windows while the window is not visible.
             self.covers.textures.clear();
             self.covers.tints.clear();

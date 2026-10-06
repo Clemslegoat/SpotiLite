@@ -65,8 +65,9 @@ votre PC que pour aller chez Spotify.
 - **Accueil** : raccourcis vers votre bibliothèque et vos dernières écoutes.
 - **Menu de gauche** : recherche, accueil, titres likés, albums, artistes, file d'attente,
   playlists et réglages.
-- **Double-clic** sur un titre pour le lire, **clic droit** pour l'ajouter à la file, aller à
-  l'album ou à l'artiste, l'aimer ou copier son lien.
+- **Double-clic** sur un titre pour le lire, **clic droit** pour l'ajouter à la file (ou l'en
+  retirer, dans la file d'attente) ou à une de vos playlists, aller à l'album ou à l'artiste,
+  l'aimer ou copier son lien.
 - **Barre du bas** : aléatoire, précédent, lecture/pause, suivant, répétition, position, file
   d'attente et volume.
 - SpotiLite apparaît comme appareil « SpotiLite » dans vos autres applications Spotify (téléphone,

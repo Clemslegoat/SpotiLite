@@ -71,7 +71,16 @@ pub enum Command {
     SetShuffle(bool),
     SetRepeat(Repeat),
     Enqueue(Track),
-    ClearQueue,
+    /// Removes the track at this position of the upcoming list (if still there).
+    RemoveFromQueue {
+        index: usize,
+        track_id: String,
+    },
+    AddToPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        track: Track,
+    },
     SetLiked {
         track: Track,
         liked: bool,
@@ -79,6 +88,8 @@ pub enum Command {
     FetchImage(String),
     ApplySettings(Box<Settings>),
     ClearCache,
+    /// Measures the disk cache (answered with `Event::CacheSize`).
+    MeasureCache,
     Shutdown,
 }
 
@@ -115,6 +126,8 @@ pub enum Event {
     },
     LoggedIn {
         user: String,
+        /// Spotify id of the user.
+        id: String,
     },
     App(AppStatus),
     Playlists(Vec<PlaylistSummary>),
@@ -187,6 +200,8 @@ pub enum Event {
     EngineStatus(String),
     /// Memory of the engine's WebView2 processes (0 when stopped).
     EngineMemory(u64),
+    /// Size of the disk cache: covers and library.
+    CacheSize(u64),
 }
 
 /// Event sender that also wakes the UI up.
@@ -265,6 +280,8 @@ enum Internal {
     PlayFailed(u64, ApiError),
     /// Checks that the engine followed pause (false) or play (true) command `.0`.
     CheckFollowed(u64, bool),
+    /// A playlist changed (its summary is read again).
+    PlaylistsChanged,
     /// Playback scopes missing from the authorization (`.1`: the browser may be opened).
     Scopes(Vec<&'static str>, bool),
     TokenFailed(String),
@@ -281,6 +298,13 @@ struct CachedTracks {
 struct CachedAlbum {
     album: AlbumSummary,
     tracks: Vec<Track>,
+}
+
+/// The user, as cached once logged in.
+#[derive(Serialize, Deserialize)]
+struct UserProfile {
+    id: String,
+    name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -510,8 +534,8 @@ impl Core {
         self.app_connected = self.api.restore().await;
         self.send_app_status();
         if self.app_connected {
-            if let Some(name) = self.store.load::<String>("me") {
-                self.ui.send(Event::LoggedIn { user: name });
+            if let Some(profile) = self.store.load::<UserProfile>("profile") {
+                self.ui.send(Event::LoggedIn { user: profile.name, id: profile.id });
             }
             self.after_connect();
         }
@@ -580,14 +604,33 @@ impl Core {
     /// The account name shown in the interface (one small request, cached).
     fn fetch_display_name(&self) {
         let Some(api) = self.api() else { return };
-        if self.store.load::<String>("me").is_some() {
+        if self.store.load::<UserProfile>("profile").is_some() {
             return;
         }
         let (ui, store) = (self.ui.clone(), self.store.clone());
         tokio::spawn(async move {
-            if let Ok(name) = api.me().await {
-                store.save("me", &name);
-                ui.send(Event::LoggedIn { user: name });
+            if let Ok((id, name)) = api.me().await {
+                store.save("profile", &UserProfile { id: id.clone(), name: name.clone() });
+                ui.send(Event::LoggedIn { user: name, id });
+            }
+        });
+    }
+
+    fn add_to_playlist(&self, playlist_id: String, playlist_name: String, track: Track) {
+        let Some(api) = self.api() else { return };
+        let (ui, internal) = (self.ui.clone(), self.internal.clone());
+        tokio::spawn(async move {
+            match api.add_to_playlist(&playlist_id, &track.id).await {
+                Ok(()) => {
+                    ui.send(Event::Info(format!("« {} » ajouté à « {playlist_name} »", track.name)));
+                    let _ = internal.send(Internal::PlaylistsChanged);
+                }
+                // Authorizations given before this menu existed lack the scope.
+                Err(e) if e.is_missing_scope() => {
+                    let _ = internal.send(Internal::Scopes(vec!["playlist-modify-private"], true));
+                }
+                Err(ApiError::Forbidden(_)) => ui.error("Spotify refuse de modifier cette playlist."),
+                Err(e) => ui.error(format!("Ajout à « {playlist_name} » impossible : {e}")),
             }
         });
     }
@@ -640,8 +683,8 @@ impl Core {
             self.playback_auth_asked = true;
             self.ui.send(Event::Notice {
                 key: "auth",
-                text: "SpotiLite a besoin d'une autorisation supplémentaire de votre application Spotify \
-                       (lecture, artistes suivis) : acceptez-la dans le navigateur qui vient de s'ouvrir."
+                text: "SpotiLite a besoin d'une autorisation supplémentaire de votre application Spotify : \
+                       acceptez-la dans le navigateur qui vient de s'ouvrir."
                     .into(),
                 error: false,
             });
@@ -759,14 +802,19 @@ impl Core {
                 }
                 self.ui.send(Event::Info(format!("« {name} » ajouté à la file")));
             }
-            Command::ClearQueue => {
-                self.queue.clear_manual();
-                self.send_queue();
+            Command::RemoveFromQueue { index, track_id } => {
+                if self.remote.is_none() && self.queue.remove_upcoming(index, &track_id) {
+                    self.send_queue();
+                }
+            }
+            Command::AddToPlaylist { playlist_id, playlist_name, track } => {
+                self.add_to_playlist(playlist_id, playlist_name, track);
             }
             Command::SetLiked { track, liked } => self.set_liked(track, liked),
             Command::FetchImage(url) => self.fetch_image(url),
             Command::ApplySettings(settings) => self.apply_settings(*settings),
             Command::ClearCache => self.clear_cache(),
+            Command::MeasureCache => self.measure_cache(),
             Command::Shutdown => {}
         }
     }
@@ -804,6 +852,7 @@ impl Core {
                 self.send_app_status();
             }
             Internal::CheckFollowed(control, playing) => self.ensure_followed(control, playing),
+            Internal::PlaylistsChanged => self.load_playlists(),
             Internal::SkipAfterFailure(generation) => {
                 if generation == self.load_generation {
                     self.skip(false);
@@ -917,6 +966,16 @@ impl Core {
         self.store.clear();
         self.refreshed.clear();
         self.ui.send(Event::Info(format!("Cache vidé ({}).", human_bytes(before))));
+        self.measure_cache();
+    }
+
+    fn measure_cache(&self) {
+        let (store, ui) = (self.store.clone(), self.ui.clone());
+        tokio::spawn(async move {
+            if let Ok(size) = tokio::task::spawn_blocking(move || store.size()).await {
+                ui.send(Event::CacheSize(size));
+            }
+        });
     }
 
     // ----------------------------------------------------------------------
