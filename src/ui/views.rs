@@ -24,7 +24,7 @@ fn surface(p: &theme::Palette, outer: Margin, inner: Margin) -> Frame {
 }
 
 /// The application mark: three white level bars in a rounded black tile.
-fn logo(ui: &Ui, center: egui::Pos2, size: f32, p: &theme::Palette) {
+pub(super) fn logo(ui: &Ui, center: egui::Pos2, size: f32, p: &theme::Palette) {
     let tile = Rect::from_center_size(center, vec2(size, size));
     ui.painter().rect_filled(tile, CornerRadius::same((size * 0.28) as u8), p.raised);
     let unit = size / 64.0;
@@ -76,30 +76,22 @@ pub fn main_layout(app: &mut App, ui: &mut Ui) {
         .show_separator_line(false)
         .frame(surface(
             &p,
-            Margin { left: GAP, right: 0, top: GAP, bottom: GAP },
-            Margin { left: 12, right: 12, top: 14, bottom: 10 },
+            Margin { left: GAP, right: 0, top: 0, bottom: GAP },
+            Margin { left: 12, right: 12, top: 12, bottom: 10 },
         ))
         .show(ui, |ui| sidebar(app, ui));
     egui::CentralPanel::default()
-        .frame(surface(&p, Margin::same(GAP), Margin { left: 26, right: 18, top: 20, bottom: 6 }))
+        .frame(surface(
+            &p,
+            Margin { left: GAP, right: GAP, top: 0, bottom: GAP },
+            Margin { left: 26, right: 18, top: 18, bottom: 6 },
+        ))
         .show(ui, |ui| content(app, ui));
 }
 
 fn sidebar(app: &mut App, ui: &mut Ui) {
     let p = app.palette;
-    // Brand.
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-    logo(ui, pos2(rect.left() + 15.0, rect.center().y), 28.0, &p);
-    paint_text(
-        ui,
-        pos2(rect.left() + 38.0, rect.center().y),
-        "SpotiLite",
-        theme::strong_font(17.0),
-        p.text,
-        140.0,
-    );
-    ui.add_space(12.0);
-
+    // The logo and name are in the title bar.
     let search = widgets::search_field(
         ui,
         &p,
@@ -262,13 +254,15 @@ fn content(app: &mut App, ui: &mut Ui) {
             let page = page.clone();
             artists_page(app, ui, &page);
         }
-        Some(Page::Tracks { title, subtitle, tracks }) => {
-            let (title, subtitle, tracks) = (title.clone(), subtitle.clone(), tracks.clone());
-            tracks_page(app, ui, &title, &subtitle, tracks);
+        Some(Page::Tracks { title, subtitle, cover, tracks }) => {
+            let (title, subtitle, cover, tracks) =
+                (title.clone(), subtitle.clone(), cover.clone(), tracks.clone());
+            tracks_page(app, ui, &title, &subtitle, cover.as_ref(), tracks);
         }
-        Some(Page::Context { title, subtitle, uri, total }) => {
-            let (title, subtitle, uri, total) = (title.clone(), subtitle.clone(), uri.clone(), *total);
-            context_page(app, ui, &title, &subtitle, &uri, total);
+        Some(Page::Context { title, subtitle, cover, uri, total }) => {
+            let (title, subtitle, cover, uri, total) =
+                (title.clone(), subtitle.clone(), cover.clone(), uri.clone(), *total);
+            context_page(app, ui, &title, &subtitle, cover.as_ref(), &uri, total);
         }
         Some(Page::Albums { title, albums }) => {
             let (title, albums) = (title.clone(), albums.clone());
@@ -367,19 +361,6 @@ fn header(app: &mut App, ui: &mut Ui, title: &str, subtitle: &str, refresh: Opti
     }
 }
 
-/// Play and shuffle buttons; returns which one was clicked.
-fn play_buttons(app: &mut App, ui: &mut Ui) -> (bool, bool) {
-    let p = app.palette;
-    let play = widgets::round_button(ui, &p, Icon::Play, 48.0, ButtonStyle::Accent, false)
-        .on_hover_text("Lecture")
-        .clicked();
-    ui.add_space(4.0);
-    let shuffle = widgets::round_button(ui, &p, Icon::Shuffle, 38.0, ButtonStyle::Plain, false)
-        .on_hover_text("Lecture aléatoire")
-        .clicked();
-    (play, shuffle)
-}
-
 /// Rounded card with a message and an optional button; true when it is clicked.
 fn notice(ui: &mut Ui, p: &theme::Palette, text: &str, action: Option<&str>) -> bool {
     let mut clicked = false;
@@ -413,59 +394,87 @@ fn note(ui: &mut Ui, p: &theme::Palette, text: &str) {
         });
 }
 
-fn tracks_page(app: &mut App, ui: &mut Ui, title: &str, subtitle: &str, tracks: Arc<Vec<Track>>) {
-    let p = app.palette;
+fn tracks_page(
+    app: &mut App,
+    ui: &mut Ui,
+    title: &str,
+    subtitle: &str,
+    cover: Option<&String>,
+    tracks: Arc<Vec<Track>>,
+) {
     let view = app.view.clone();
     let total: u64 = tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
-    let mut info = format!("{} titres · {}", tracks.len(), format_total(total));
+    let mut detail = format!("{} · {}", plural(tracks.len(), "titre", "titres"), format_total(total));
     if !subtitle.is_empty() {
-        info = format!("{subtitle} · {info}");
+        detail = format!("{subtitle} · {detail}");
     }
-    header(app, ui, title, &info, Some(&view));
-    ui.add_space(12.0);
-    let visible = app.visible_tracks().unwrap_or_else(|| tracks.clone());
-    ui.horizontal(|ui| {
-        let (play, shuffle) = play_buttons(app, ui);
-        if play && !visible.is_empty() {
-            if app.player.shuffle {
-                app.player.shuffle = false;
-                app.settings.shuffle = false;
-                app.send(Command::SetShuffle(false));
-            }
-            app.play(visible.clone(), 0);
-        }
-        if shuffle && !visible.is_empty() {
-            app.player.shuffle = true;
-            app.settings.shuffle = true;
-            app.send(Command::SetShuffle(true));
-            let start = rand::random_range(0..visible.len());
-            app.play(visible.clone(), start);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            widgets::search_field(ui, &p, &mut app.filter, "Filtrer", 210.0, Icon::Search);
-        });
-    });
+    back_row(app, ui, Some(&view), true);
     ui.add_space(10.0);
+    let liked = view == ViewKey::Liked;
+    let liked_key = super::ambient::LIKED.to_string();
+    let (play, shuffle) = banner(
+        app,
+        ui,
+        &Banner {
+            kind: if matches!(view, ViewKey::Album(_)) { "ALBUM" } else { "PLAYLIST" },
+            title,
+            detail: &detail,
+            image: if liked { Some(&liked_key) } else { cover },
+            picture: if liked { Picture::Icon(Icon::Heart { filled: true }) } else { Picture::Cover },
+            play_hint: "Lecture",
+        },
+    );
+    let visible = app.visible_tracks().unwrap_or_else(|| tracks.clone());
+    if play && !visible.is_empty() {
+        if app.player.shuffle {
+            app.player.shuffle = false;
+            app.settings.shuffle = false;
+            app.send(Command::SetShuffle(false));
+        }
+        app.play(visible.clone(), 0);
+    }
+    if shuffle && !visible.is_empty() {
+        app.player.shuffle = true;
+        app.settings.shuffle = true;
+        app.send(Command::SetShuffle(true));
+        let start = rand::random_range(0..visible.len());
+        app.play(visible.clone(), start);
+    }
+    ui.add_space(12.0);
     track_table(app, ui, visible, "tracks");
 }
 
-fn context_page(app: &mut App, ui: &mut Ui, title: &str, subtitle: &str, uri: &str, total: u32) {
+fn context_page(
+    app: &mut App,
+    ui: &mut Ui,
+    title: &str,
+    subtitle: &str,
+    cover: Option<&String>,
+    uri: &str,
+    total: u32,
+) {
     let p = app.palette;
     let view = app.view.clone();
-    let info = match (subtitle.is_empty(), total) {
-        (true, 0) => "Playlist".to_string(),
-        (true, n) => format!("{n} titres"),
+    let detail = match (subtitle.is_empty(), total) {
+        (true, 0) => String::new(),
+        (true, n) => plural(n as usize, "titre", "titres"),
         (false, 0) => subtitle.to_string(),
-        (false, n) => format!("{subtitle} · {n} titres"),
+        (false, n) => format!("{subtitle} · {}", plural(n as usize, "titre", "titres")),
     };
-    header(app, ui, title, &info, Some(&view));
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        let (play, shuffle) = play_buttons(app, ui);
-        if play || shuffle {
-            app.play_context(uri.to_string(), title.to_string(), shuffle, total);
-        }
-    });
+    back_row(app, ui, Some(&view), false);
+    ui.add_space(10.0);
+    let banner_info = Banner {
+        kind: "PLAYLIST",
+        title,
+        detail: &detail,
+        image: cover,
+        picture: Picture::Cover,
+        play_hint: "Lecture",
+    };
+    let (play, shuffle) = banner(app, ui, &banner_info);
+    if play || shuffle {
+        app.play_context(uri.to_string(), title.to_string(), shuffle, total);
+    }
     ui.add_space(14.0);
     note(
         ui,
@@ -474,6 +483,106 @@ fn context_page(app: &mut App, ui: &mut Ui, title: &str, subtitle: &str, uri: &s
          (seulement celui de vos propres playlists). Elle est donc lue telle quelle par Spotify : les titres \
          s'affichent au fil de la lecture, et la file d'attente montre les suivants.",
     );
+}
+
+/// What the tile of a banner shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Picture {
+    /// The image, square with rounded corners.
+    Cover,
+    /// The image in a circle (artists).
+    Portrait,
+    /// An icon on the banner's colors (pages without a picture).
+    Icon(Icon),
+}
+
+struct Banner<'a> {
+    kind: &'a str,
+    title: &'a str,
+    detail: &'a str,
+    /// Picture, whose colors also paint the banner.
+    image: Option<&'a String>,
+    picture: Picture,
+    play_hint: &'a str,
+}
+
+const BANNER_HEIGHT: f32 = 164.0;
+
+/// Page header in the colors of its picture: picture, kind, title, details,
+/// and the play and shuffle buttons. Returns which button was clicked.
+fn banner(app: &mut App, ui: &mut Ui, info: &Banner) -> (bool, bool) {
+    let p = app.palette;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), BANNER_HEIGHT), Sense::hover());
+    let ctx = ui.ctx().clone();
+    let ambient = info.image.and_then(|url| app.ambient(&ctx, url, Ambient::Banner));
+    let full_uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    match ambient {
+        Some(texture) => {
+            ui.painter().add(
+                egui::epaint::RectShape::filled(rect, CornerRadius::same(RADIUS_CARD), Color32::WHITE)
+                    .with_texture(texture, full_uv),
+            );
+        }
+        None => {
+            ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_CARD), p.raised);
+        }
+    }
+
+    let tile = Rect::from_min_size(rect.min + vec2(20.0, 20.0), vec2(124.0, 124.0));
+    match info.picture {
+        Picture::Portrait => {
+            let texture = if app.settings.show_covers { app.cover(info.image) } else { None };
+            widgets::avatar(ui, &p, tile, texture, info.title);
+        }
+        Picture::Cover => {
+            let texture = if app.settings.show_covers { app.cover(info.image) } else { None };
+            widgets::cover(ui, &p, tile, texture, 10);
+        }
+        Picture::Icon(icon) => {
+            // A light violet tile (the color of the liked tracks banner), icon on top.
+            ui.painter().rect_filled(tile, CornerRadius::same(10), Color32::from_rgb(112, 86, 226));
+            let sheen = Rect::from_min_max(tile.min, pos2(tile.right(), tile.center().y));
+            let top = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
+            ui.painter().rect_filled(sheen, top, Color32::from_white_alpha(14));
+            widgets::paint_icon(ui.painter(), tile.shrink(38.0), icon, Color32::WHITE);
+        }
+    }
+
+    // Buttons on the right, text in between.
+    let play_rect = Rect::from_center_size(pos2(rect.right() - 52.0, rect.center().y), vec2(52.0, 52.0));
+    let shuffle_rect =
+        Rect::from_center_size(pos2(play_rect.left() - 30.0, rect.center().y), vec2(40.0, 40.0));
+    let x = tile.right() + 24.0;
+    let width = (shuffle_rect.left() - 16.0 - x).max(40.0);
+    let light = Color32::from_gray(0xd8);
+    let cy = rect.center().y;
+    paint_text(ui, pos2(x, cy - 32.0), info.kind, theme::strong_font(11.5), light, width);
+    paint_text(ui, pos2(x, cy), info.title, theme::strong_font(34.0), p.text, width);
+    paint_text(ui, pos2(x, cy + 32.0), info.detail, theme::body_font(), light, width);
+
+    // Child areas that do not move the page layout (the list starts under the banner).
+    let play = widgets::round_button(
+        &mut ui.new_child(UiBuilder::new().max_rect(play_rect)),
+        &p,
+        Icon::Play,
+        52.0,
+        ButtonStyle::Accent,
+        false,
+    )
+    .on_hover_text(info.play_hint)
+    .clicked();
+    let shuffle = widgets::icon_button(
+        &mut ui.new_child(UiBuilder::new().max_rect(shuffle_rect)),
+        &p,
+        Icon::Shuffle,
+        40.0,
+        28.0,
+        ButtonStyle::Bright,
+        false,
+    )
+    .on_hover_text("Lecture aléatoire")
+    .clicked();
+    (play, shuffle)
 }
 
 fn artist_page(
@@ -487,32 +596,8 @@ fn artist_page(
     let p = app.palette;
     let view = app.view.clone();
     let ViewKey::Artist(id) = &view else { return };
-    back_row(app, ui, Some(&view));
+    back_row(app, ui, Some(&view), false);
     ui.add_space(10.0);
-
-    // Banner in the colors of the portrait.
-    let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 172.0), Sense::hover());
-    let ctx = ui.ctx().clone();
-    match image.and_then(|url| app.ambient(&ctx, url, Ambient::Banner)) {
-        Some(texture) => {
-            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            ui.painter().add(
-                egui::epaint::RectShape::filled(banner, CornerRadius::same(RADIUS_CARD), Color32::WHITE)
-                    .with_texture(texture, uv),
-            );
-        }
-        None => {
-            ui.painter().rect_filled(banner, CornerRadius::same(RADIUS_CARD), p.raised);
-        }
-    }
-    let portrait = Rect::from_min_size(banner.min + vec2(22.0, 20.0), vec2(132.0, 132.0));
-    let texture = if app.settings.show_covers { app.cover(image) } else { None };
-    widgets::avatar(ui, &p, portrait, texture, name);
-    let x = portrait.right() + 24.0;
-    let width = banner.right() - x - 20.0;
-    let light = Color32::from_gray(0xd4);
-    paint_text(ui, pos2(x, banner.center().y - 34.0), "ARTISTE", theme::strong_font(11.5), light, width);
-    paint_text(ui, pos2(x, banner.center().y), name, theme::strong_font(38.0), p.text, width);
     let mut stats = Vec::new();
     if !liked.is_empty() {
         stats.push(plural(liked.len(), "titre liké", "titres likés"));
@@ -520,19 +605,20 @@ fn artist_page(
     if !albums.is_empty() {
         stats.push(plural(albums.len(), "sortie", "sorties"));
     }
-    paint_text(ui, pos2(x, banner.center().y + 36.0), &stats.join(" · "), theme::body_font(), light, width);
-    ui.add_space(14.0);
-
-    let uri = format!("spotify:artist:{id}");
-    ui.horizontal(|ui| {
-        let (play, shuffle) = play_buttons(app, ui);
-        if play || shuffle {
-            app.play_context(uri.clone(), name.to_string(), shuffle, 0);
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Ses titres populaires, choisis par Spotify").color(p.faint));
-    });
-    ui.add_space(14.0);
+    let detail = stats.join(" · ");
+    let banner_info = Banner {
+        kind: "ARTISTE",
+        title: name,
+        detail: &detail,
+        image,
+        picture: Picture::Portrait,
+        play_hint: "Lecture de ses titres populaires, choisis par Spotify",
+    };
+    let (play, shuffle) = banner(app, ui, &banner_info);
+    if play || shuffle {
+        app.play_context(format!("spotify:artist:{id}"), name.to_string(), shuffle, 0);
+    }
+    ui.add_space(16.0);
     ScrollArea::vertical().id_salt("artist").auto_shrink([false, false]).show(ui, |ui| {
         if !liked.is_empty() {
             section_title(ui, &p, "Dans vos titres likés");
@@ -544,6 +630,9 @@ fn artist_page(
             for album in albums {
                 album_row(app, ui, album);
             }
+        }
+        if liked.is_empty() && albums.is_empty() {
+            note(ui, &p, "▶ fait jouer ses titres populaires par Spotify.");
         }
         ui.add_space(12.0);
     });
@@ -645,8 +734,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
 }
 
-/// Back button and, on the right, the refresh button.
-fn back_row(app: &mut App, ui: &mut Ui, refresh: Option<&ViewKey>) {
+/// Back button and, on the right, the refresh button and the list filter.
+fn back_row(app: &mut App, ui: &mut Ui, refresh: Option<&ViewKey>, filter: bool) {
     let p = app.palette;
     ui.horizontal(|ui| {
         ui.set_min_height(32.0);
@@ -657,8 +746,8 @@ fn back_row(app: &mut App, ui: &mut Ui, refresh: Option<&ViewKey>) {
         {
             app.back();
         }
-        if let Some(view) = refresh {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let Some(view) = refresh {
                 if app.loading.contains(view) {
                     ui.add(egui::Spinner::new().color(p.accent).size(16.0));
                 } else if widgets::round_button(ui, &p, Icon::Refresh, 30.0, ButtonStyle::Plain, false)
@@ -668,8 +757,12 @@ fn back_row(app: &mut App, ui: &mut Ui, refresh: Option<&ViewKey>) {
                     let view = view.clone();
                     app.navigate_with(view, true);
                 }
-            });
-        }
+            }
+            if filter {
+                ui.add_space(6.0);
+                widgets::search_field(ui, &p, &mut app.filter, "Filtrer", 210.0, Icon::Search);
+            }
+        });
     });
 }
 

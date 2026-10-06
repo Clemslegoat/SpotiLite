@@ -16,8 +16,8 @@ de 700 Mo** pour l'application officielle, mesuré sur le même PC.
   file d'attente, aléatoire, répétition.
 - **Le vrai son de Spotify** : la musique est lue par le lecteur officiel de Spotify, en qualité
   Premium.
-- **Sobre** : fond noir profond (idéal sur écran OLED), coins arrondis, barre de lecture aux
-  couleurs de la pochette.
+- **Sobre** : fond noir profond (idéal sur écran OLED), coins arrondis, en-têtes et barre de
+  lecture aux couleurs de la pochette, barre de titre maison avec boutons aux couleurs de macOS.
 - **Économe en données** : bibliothèque gardée en cache, petites pochettes (désactivables).
 - **Intégré à Windows** : touches multimédia du clavier, panneau média de Windows, écran de
   verrouillage.
@@ -181,7 +181,7 @@ Linux (X11) pour le développement ; la lecture n'existe que sous Windows.
 src/
 ├── main.rs          démarrage, icône dessinée par le code
 ├── window.rs        fenêtre winit + egui, rendu par le processeur (softbuffer)
-├── ui/              interface egui (thème, écrans, widgets, icônes, fond de la barre)
+├── ui/              interface egui (thème, écrans, barre de titre, widgets, icônes, dégradés)
 ├── backend/         fil réseau (Tokio, un seul fil)
 │   ├── mod.rs       commandes, file de lecture, cache de bibliothèque
 │   ├── engine/      lecteur : WebView2 invisible + Web Playback SDK de Spotify

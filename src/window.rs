@@ -5,13 +5,17 @@
 //!
 //! The interface is only redrawn when something happens (input, backend event,
 //! or once per second while music plays), so the CPU stays idle.
+//!
+//! The window has no system title bar: the application draws its own (drag
+//! area and buttons), the system keeps the shadow, snapping and, on Windows 11,
+//! the rounded corners.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui::{ViewportId, ViewportInfo};
+use egui::{ViewportEvent, ViewportId, ViewportInfo};
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -116,8 +120,16 @@ impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> ApplicationHandler<Wake> f
                 return;
             }
             WindowEvent::RedrawRequested => {
-                if let Err(e) = running.paint(&self.ctx) {
-                    log::warn!("paint: {e}");
+                match running.paint(&self.ctx) {
+                    // The close button of the application's own title bar.
+                    Ok(true) => {
+                        running.app.on_exit();
+                        running.window.set_visible(false);
+                        self.window = None;
+                        event_loop.exit();
+                    }
+                    Ok(false) => {}
+                    Err(e) => log::warn!("paint: {e}"),
                 }
                 return;
             }
@@ -153,11 +165,20 @@ impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> Runner<A, F> {
             .with_app_id("spotilite")
             .with_inner_size(self.options.inner_size)
             .with_min_inner_size(self.options.min_size)
-            .with_icon(Arc::new(self.options.icon.clone()));
-        let window =
-            Rc::new(egui_winit::create_window(&self.ctx, event_loop, &builder).map_err(|e| e.to_string())?);
-        // Dark title bar on Windows 10/11, to match the black window.
+            .with_icon(Arc::new(self.options.icon.clone()))
+            .with_decorations(false);
+        #[allow(unused_mut)]
+        let mut attributes = egui_winit::create_winit_window_attributes(&self.ctx, builder.clone());
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes.with_undecorated_shadow(true);
+        }
+        let window = Rc::new(event_loop.create_window(attributes).map_err(|e| e.to_string())?);
+        egui_winit::apply_viewport_builder_to_window(&self.ctx, &window, &builder);
         window.set_theme(Some(Theme::Dark));
+        #[cfg(windows)]
+        round_corners(&window);
         let display = softbuffer::Context::new(window.clone()).map_err(|e| e.to_string())?;
         let surface = softbuffer::Surface::new(&display, window.clone()).map_err(|e| e.to_string())?;
         let input = egui_winit::State::new(
@@ -181,8 +202,31 @@ impl<A: App, F: FnOnce(&egui::Context, &Window) -> A> Runner<A, F> {
     }
 }
 
+/// Windows 11 rounds the corners of windows with a system title bar only: ask
+/// for it explicitly (no effect on Windows 10).
+#[cfg(windows)]
+fn round_corners(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let preference = DWMWCP_ROUND;
+    // SAFETY: a valid window handle and a pointer to a value of the documented size.
+    unsafe {
+        DwmSetWindowAttribute(
+            handle.hwnd.get() as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE as _,
+            (&raw const preference).cast(),
+            std::mem::size_of_val(&preference) as u32,
+        );
+    }
+}
+
 impl<A: App> Running<A> {
-    fn paint(&mut self, ctx: &egui::Context) -> Result<(), String> {
+    /// Draws a frame; returns true when the application asked to close.
+    fn paint(&mut self, ctx: &egui::Context) -> Result<bool, String> {
         egui_winit::update_viewport_info(&mut self.info, ctx, &self.window, false);
         let mut raw_input = self.input.take_egui_input(&self.window);
         raw_input.viewports.insert(ViewportId::ROOT, self.info.clone());
@@ -204,6 +248,7 @@ impl<A: App> Running<A> {
                 );
             }
         }
+        let close = self.info.events.drain(..).any(|e| e == ViewportEvent::Close);
 
         // Texture changes (glyphs, covers) must be applied even when nothing is drawn.
         let mut textures = std::mem::take(&mut output.textures_delta);
@@ -220,7 +265,7 @@ impl<A: App> Running<A> {
             }
         };
         textures.clear();
-        result
+        result.map(|()| close)
     }
 
     fn draw(

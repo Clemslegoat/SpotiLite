@@ -6,6 +6,7 @@
 
 mod ambient;
 mod theme;
+mod titlebar;
 mod views;
 mod widgets;
 
@@ -35,12 +36,15 @@ pub enum Page {
     Tracks {
         title: String,
         subtitle: String,
+        /// Album or playlist cover, for the banner.
+        cover: Option<String>,
         tracks: Arc<Vec<Track>>,
     },
     /// A playlist Spotify only plays as a whole (its tracks are not readable).
     Context {
         title: String,
         subtitle: String,
+        cover: Option<String>,
         uri: String,
         total: u32,
     },
@@ -270,6 +274,7 @@ impl App {
                     owner: "demo".into(),
                     total: 40 + i as u32 * 13,
                     snapshot_id: String::new(),
+                    image: None,
                 })
                 .collect();
         // A synthetic cover (dusk gradient) to show the player bar colors.
@@ -310,7 +315,17 @@ impl App {
             Page::Tracks {
                 title: "Titres likés".into(),
                 subtitle: String::new(),
+                cover: None,
                 tracks: Arc::new(tracks.clone()),
+            },
+        );
+        self.pages.insert(
+            ViewKey::Playlist("p0".into()),
+            Page::Tracks {
+                title: "Découvertes".into(),
+                subtitle: "Démo".into(),
+                cover: Some("demo-cover".into()),
+                tracks: Arc::new(tracks.iter().skip(3).step_by(3).take(30).cloned().collect()),
             },
         );
         self.engine_status = "Prêt · DRM Widevine".into();
@@ -361,6 +376,7 @@ impl App {
                 year: format!("{}", 2025 - i * 2),
                 total_tracks: 6 + i as u32 * 2,
                 image: if i == 0 { Some("demo-cover".into()) } else { None },
+                cover: None,
             })
             .collect();
         self.pages.insert(
@@ -378,6 +394,7 @@ impl App {
                 "queue" => ViewKey::Queue,
                 "artists" => ViewKey::Artists,
                 "artist" => ViewKey::Artist("a2".into()),
+                "playlist" => ViewKey::Playlist("p0".into()),
                 _ => ViewKey::Liked,
             };
             self.history.push(ViewKey::Liked);
@@ -467,11 +484,11 @@ impl App {
                 self.failures.remove(&view);
                 self.loading.insert(view);
             }
-            Event::Tracks { view, title, subtitle, tracks } => {
-                self.store_page(view, Page::Tracks { title, subtitle, tracks });
+            Event::Tracks { view, title, subtitle, cover, tracks } => {
+                self.store_page(view, Page::Tracks { title, subtitle, cover, tracks });
             }
-            Event::PlaylistContext { view, title, subtitle, uri, total } => {
-                self.store_page(view, Page::Context { title, subtitle, uri, total });
+            Event::PlaylistContext { view, title, subtitle, cover, uri, total } => {
+                self.store_page(view, Page::Context { title, subtitle, cover, uri, total });
             }
             Event::Albums { view, title, albums } => self.store_page(view, Page::Albums { title, albums }),
             Event::Artists(page) => self.store_page(ViewKey::Artists, Page::Artists(page)),
@@ -573,6 +590,9 @@ impl App {
             && current == url
         {
             return Some(texture.id());
+        }
+        if url == ambient::LIKED && !self.covers.tints.contains_key(url) {
+            self.covers.tints.insert(url.clone(), ambient::liked_tint());
         }
         let Some(tint) = self.covers.tints.get(url) else {
             // Arrives with the image itself.
@@ -844,12 +864,15 @@ impl crate::window::App for App {
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             self.settings.window_size = [rect.width() * ctx.zoom_factor(), rect.height() * ctx.zoom_factor()];
         }
+        let palette = self.palette;
+        titlebar::show(ui, &palette, |ui, center, size| views::logo(ui, center, size, &palette));
         match self.app_status.state {
             AppState::Unknown => views::splash(self, ui),
             _ if self.needs_setup() => views::setup_screen(self, ui),
             _ => views::main_layout(self, ui),
         }
         views::toasts(self, &ctx);
+        titlebar::resize_edges(&ctx);
     }
 
     fn on_exit(&mut self) {

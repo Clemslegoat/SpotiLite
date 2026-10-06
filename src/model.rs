@@ -87,6 +87,9 @@ pub struct AlbumSummary {
     pub total_tracks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Larger cover (≈300 px) for the page banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +124,9 @@ pub struct PlaylistSummary {
     /// Changes whenever the playlist content changes: lets us reuse the disk cache
     /// without downloading the tracks again.
     pub snapshot_id: String,
+    /// Cover (≈300 px) for the page banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

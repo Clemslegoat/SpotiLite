@@ -119,6 +119,8 @@ pub enum Event {
         view: ViewKey,
         title: String,
         subtitle: String,
+        /// Cover shown in the page banner (album or playlist).
+        cover: Option<String>,
         tracks: Arc<Vec<Track>>,
     },
     /// A playlist whose tracks Spotify does not give to development mode
@@ -127,6 +129,7 @@ pub enum Event {
         view: ViewKey,
         title: String,
         subtitle: String,
+        cover: Option<String>,
         uri: String,
         total: u32,
     },
@@ -1489,6 +1492,7 @@ impl Core {
                         view: view.clone(),
                         title: "Titres likés".into(),
                         subtitle: String::new(),
+                        cover: None,
                         tracks: Arc::new(c.tracks.clone()),
                     });
                     if self.fresh(&view, Duration::from_secs(600), force) {
@@ -1511,6 +1515,7 @@ impl Core {
                                     view: view.clone(),
                                     title: "Titres likés".into(),
                                     subtitle: String::new(),
+                                    cover: None,
                                     tracks: Arc::new(tracks.clone()),
                                 });
                                 store.save(
@@ -1598,6 +1603,7 @@ impl Core {
                 let title = summary.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Playlist".into());
                 let subtitle = summary.as_ref().map(|p| p.owner.clone()).unwrap_or_default();
                 let total = summary.as_ref().map_or(0, |p| p.total);
+                let cover = summary.as_ref().and_then(|p| p.image.clone());
                 let key = format!("playlist-{id}");
                 let cached = store.load::<CachedTracks>(&key);
                 let cache_valid = cached.as_ref().is_some_and(|c| match &summary {
@@ -1609,6 +1615,7 @@ impl Core {
                         view: view.clone(),
                         title: title.clone(),
                         subtitle: subtitle.clone(),
+                        cover: cover.clone(),
                         tracks: Arc::new(c.tracks.clone()),
                     });
                     if cache_valid && !force {
@@ -1625,14 +1632,14 @@ impl Core {
                                 &key,
                                 &CachedTracks { snapshot, saved_at: now_secs(), tracks: tracks.clone() },
                             );
-                            ui.send(Event::Tracks { view, title, subtitle, tracks: Arc::new(tracks) });
+                            ui.send(Event::Tracks { view, title, subtitle, cover, tracks: Arc::new(tracks) });
                         }
                         // Development mode applications only read the user's own
                         // playlists: Spotify can still play the others as a whole.
                         Err(e @ (ApiError::Forbidden(_) | ApiError::NotFound)) => {
                             log::info!("playlist {id} not readable ({e}): played as a whole");
                             let uri = format!("spotify:playlist:{id}");
-                            ui.send(Event::PlaylistContext { view, title, subtitle, uri, total });
+                            ui.send(Event::PlaylistContext { view, title, subtitle, cover, uri, total });
                         }
                         Err(e) => ui.send(Event::ViewFailed { view, message: e.to_string() }),
                     }
@@ -1722,6 +1729,7 @@ impl Core {
                     view: view.clone(),
                     title: "Titres likés".into(),
                     subtitle: String::new(),
+                    cover: None,
                     tracks: Arc::new(c.tracks),
                 }),
                 ViewKey::SavedAlbums => store
@@ -1748,6 +1756,7 @@ impl Core {
                         view: view.clone(),
                         title: summary.map(|p| p.name.clone()).unwrap_or_default(),
                         subtitle: summary.map(|p| p.owner.clone()).unwrap_or_default(),
+                        cover: summary.and_then(|p| p.image.clone()),
                         tracks: Arc::new(c.tracks),
                     }
                 }),
@@ -1882,7 +1891,8 @@ fn album_event(view: ViewKey, cached: CachedAlbum) -> Event {
     } else {
         format!("{} · {}", cached.album.artists, cached.album.year)
     };
-    Event::Tracks { view, title: cached.album.name, subtitle, tracks: Arc::new(cached.tracks) }
+    let cover = cached.album.cover.or(cached.album.image);
+    Event::Tracks { view, title: cached.album.name, subtitle, cover, tracks: Arc::new(cached.tracks) }
 }
 
 fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {

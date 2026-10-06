@@ -677,6 +677,17 @@ fn small_image(images: &[ImageJson]) -> Option<String> {
         .map(|i| i.url.clone())
 }
 
+/// Picks the smallest image that stays sharp in a 128 px slot (page banners).
+/// Images of unknown size (custom playlist covers) count as large.
+fn medium_image(images: &[ImageJson]) -> Option<String> {
+    images
+        .iter()
+        .filter(|i| i.width.is_none_or(|w| w >= 120))
+        .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+        .or_else(|| images.first())
+        .map(|i| i.url.clone())
+}
+
 fn track_from(value: Value, album: Option<&AlbumRef>) -> Option<Track> {
     let t: TrackJson = serde_json::from_value(value).ok()?;
     if t.kind.as_deref().is_some_and(|k| k != "track") {
@@ -722,6 +733,7 @@ fn album_from(value: Value) -> Option<AlbumSummary> {
         year: a.release_date.chars().take(4).collect(),
         total_tracks: a.total_tracks,
         image: small_image(&a.images),
+        cover: medium_image(&a.images),
     })
 }
 
@@ -746,6 +758,8 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
         items: Option<Value>,
         #[serde(default)]
         snapshot_id: Option<String>,
+        #[serde(default)]
+        images: Option<Vec<ImageJson>>,
     }
     let p: PlaylistJson = serde_json::from_value(value).ok()?;
     let total = p
@@ -761,6 +775,7 @@ fn playlist_from(value: Value) -> Option<PlaylistSummary> {
         owner: p.owner.map(|o| o.display_name.filter(|n| !n.is_empty()).unwrap_or(o.id)).unwrap_or_default(),
         total,
         snapshot_id: p.snapshot_id.unwrap_or_default(),
+        image: p.images.as_deref().and_then(medium_image),
     })
 }
 
@@ -777,6 +792,19 @@ mod tests {
         let artist = artist_summary(serde_json::from_value(json).unwrap()).unwrap();
         assert_eq!(artist.image.as_deref(), Some("small"));
         assert!(artist_summary(serde_json::from_value(json!({"name": "no id"})).unwrap()).is_none());
+    }
+
+    #[test]
+    fn banners_get_a_medium_cover() {
+        let album = json!({"id": "al", "name": "A", "images": [
+            {"url": "640", "width": 640}, {"url": "300", "width": 300}, {"url": "64", "width": 64}
+        ]});
+        let album = album_from(album).unwrap();
+        assert_eq!((album.image.as_deref(), album.cover.as_deref()), (Some("64"), Some("300")));
+        let custom = json!({"id": "p", "name": "P", "images": [{"url": "custom", "width": null}]});
+        assert_eq!(playlist_from(custom).unwrap().image.as_deref(), Some("custom"));
+        let none = json!({"id": "q", "name": "Q", "images": null});
+        assert_eq!(playlist_from(none).unwrap().image, None);
     }
 
     #[test]
