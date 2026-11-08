@@ -29,22 +29,33 @@ official apps.
 
 ## Memory usage
 
-<!-- Measurements to come: replace the zeros (RAM in MB while playing, Task Manager). -->
+Measured in the Windows Task Manager (Memory column, all processes of each app added up) on the
+same PC: the official Spotify desktop app versus SpotiLite, including its hidden WebView2 player
+while music is playing.
 
 ```mermaid
 ---
 config:
   look: handDrawn
   xyChart:
-    width: 720
-    height: 360
+    width: 800
+    height: 380
 ---
 xychart-beta
-    title "RAM while playing (MB, lower is better)"
-    x-axis ["Spotify for Windows", "SpotiLite"]
-    y-axis "MB" 0 --> 800
-    bar [0, 0]
+    title "RAM usage on Windows (MB, lower is better)"
+    x-axis ["Spotify (paused)", "SpotiLite (paused)", "Spotify (playing)", "SpotiLite (playing)"]
+    y-axis "MB" 0 --> 1100
+    bar [665.9, 13.7, 995.5, 117.6]
 ```
+
+| | Spotify for Windows | SpotiLite | Difference |
+|---|---|---|---|
+| Playing | 995.5 MB | 117.6 MB (18.5 interface + 99.1 player) | **~8.5× less** |
+| Paused / idle | 665.9 MB | 13.7 MB (player asleep or not started) | **~49× less** |
+
+The player (hidden WebView2) only starts on first playback and can be put to sleep after a few
+minutes of pause, so when idle only the small interface process stays in memory. Figures come from
+a single machine and will vary with your system, library size and WebView2 version.
 
 ## Features
 
